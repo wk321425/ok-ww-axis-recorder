@@ -1,0 +1,11 @@
+{
+  "file_name": "axis_recorder",
+  "script_name": "跑轴记录",
+  "version": "0.3.0",
+  "tasks": [
+    ["AxisRecorder", "AxisRecorderTask"]
+  ],
+  "custom_tabs": [
+    ["RecorderTab", "AxisRecorderTab"]
+  ]
+}
