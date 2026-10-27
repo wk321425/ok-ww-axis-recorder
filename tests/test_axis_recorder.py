@@ -422,11 +422,36 @@ class TestMedia(PluginCase):
         self.assertEqual(len(media.MediaIndex(run.path).frames), 1)
 
     def test_ring_capped_by_memory(self):
-        with patch.object(media, 'FRAME_INTERVAL', 0.0), patch.object(media, 'RING_MEMORY_CAP', 3 * 108 * 192 * 4):
+        with patch.object(media, 'FRAME_INTERVAL', 0.0), patch.object(media, 'RING_MEMORY_CAP', 3 * 108 * 192 * 4), \
+                patch.object(media, 'RING_GUARANTEE_SECONDS', 0.1):
             self.start()
             self.feed([self.screen(v, 108, 192) for v in range(6)])
             self.assertEqual([int(f[0, 0, 0]) for _, f in self.recorder.sink.recent()], [3, 4, 5])
             self.finish()
+
+    def test_ring_frames_by_resolution(self):
+        # 每秒 4 帧, 320MB 上限, 保证 4 秒
+        sizes = {'1080p': 1920 * 1080 * 4, '2K': 2560 * 1440 * 4, '4K': 3840 * 2160 * 4}
+        self.assertEqual({k: media.ring_frames(16, n) for k, n in sizes.items()}, {'1080p': 16, '2K': 16, '4K': 16})
+        self.assertEqual({k: media.ring_frames(40, n) for k, n in sizes.items()}, {'1080p': 40, '2K': 22, '4K': 16})
+        self.assertEqual(media.ring_frames(8, sizes['4K']), 8)
+
+    def test_export_notes_memory_limit(self):
+        self.plugin.config[TASK_CLASS.FRAMES_KEY] = False
+        with patch.object(media, 'FRAME_INTERVAL', 0.0), patch.object(media, 'RING_MEMORY_CAP', 1), \
+                patch.object(media, 'RING_GUARANTEE_SECONDS', 0.1):
+            self.start()
+            self.feed([self.screen(v, 108, 192) for v in range(4)])
+            self.assertEqual([int(f[0, 0, 0]) for _, f in self.recorder.sink.recent()], [2, 3])
+            with patch.object(self.recorder, '_notify') as notify:
+                thread = self.recorder.export_recent()
+                thread.join(10)
+            self.finish()
+        with open(os.path.join(self.recorder.last_export, 'info.json'), encoding='utf-8') as f:
+            info = json.load(f)
+        self.assertEqual((info['export_seconds'], info['ring_seconds']), (4.0, 0.1))
+        self.assertIn('192x108', info['note'])
+        self.assertIn('只留得下最近 0.1 秒', notify.call_args[0][0])
 
     def test_reused_buffer_is_copied(self):
         buffer = np.zeros((108, 192, 4), np.uint8)
@@ -459,6 +484,8 @@ class TestMedia(PluginCase):
             info = json.load(f)
         self.assertEqual(len(info['frames']), 2)
         self.assertEqual(info['size'], [1920, 1080])
+        self.assertEqual(info['export_seconds'], 4.0)
+        self.assertNotIn('note', info)
         png = cv2.imdecode(np.fromfile(os.path.join(folder, info['frames'][1]['file']), np.uint8), cv2.IMREAD_COLOR)
         self.assertEqual((png.shape, int(png[0, 0, 0])), ((1080, 1920, 3), 80))
         # 打完一会儿内还能导

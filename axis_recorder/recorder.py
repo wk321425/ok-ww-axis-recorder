@@ -17,7 +17,8 @@ from pathlib import Path
 
 from ok import Logger
 
-from .media import HOTKEYS, RING_IDLE_KEEP, FrameSink, HotkeyThread, MediaWriter, export_frames, prune_media
+from .media import (HOTKEYS, RING_IDLE_KEEP, FrameSink, HotkeyThread, MediaWriter, export_frames, prune_media,
+                    ring_limit_note)
 
 logger = Logger.get_logger(__name__)
 
@@ -619,7 +620,9 @@ class Recorder:
             folder, files = export_frames(self.out_dir, sink, frames, sink.run.team_dir)
             self.last_export = folder
             if files:
-                self._notify(f"跑轴记录: 导出 {len(files)} 张原图({files[0]['t']:.2f}~{files[-1]['t']:.2f}s)到 {folder}")
+                note = ring_limit_note(sink)
+                self._notify(f"跑轴记录: 导出 {len(files)} 张原图({files[0]['t']:.2f}~{files[-1]['t']:.2f}s)到 {folder}"
+                             + (f'。{note}' if note else ''))
         except Exception as e:
             logger.error('跑轴记录: 导出出错', e)
         finally:

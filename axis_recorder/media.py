@@ -25,7 +25,9 @@ MEDIA_VERSION = 1
 FRAME_INTERVAL = 0.25
 LOW_WIDTH = 960
 JPEG_QUALITY = 70
-# 热键导出用的原图都留在内存里(2K 一帧 14.7MB), 秒数再长也不超过这么多
+# 热键导出用的原图都留在内存里(BGRA 一帧 1080p 8.3MB / 2K 14.7MB / 4K 33.2MB)。
+# 这么多秒以内任何分辨率都留够(4K 约 530MB); 设得更长时, 多出来的部分不超过内存上限
+RING_GUARANTEE_SECONDS = 4.0
 RING_MEMORY_CAP = 320 * 1024 * 1024
 # 一局打完原图再留这么久, 打完马上按热键也导得出来
 RING_IDLE_KEEP = 60.0
@@ -70,6 +72,13 @@ def _bgra_base(frame):
 def frame_bytes(frame):
     base = _bgra_base(frame)
     return (base if base is not None else frame).nbytes
+
+
+def ring_frames(want, nbytes):
+    """热键导出留几帧: 保证的秒数以内照设置留, 再长按内存上限截。"""
+    step = max(FRAME_INTERVAL, 0.05)
+    guaranteed = int(round(RING_GUARANTEE_SECONDS / step))
+    return max(1, min(want, max(guaranteed, RING_MEMORY_CAP // max(1, nbytes))))
 
 
 def shrink(frame, width=LOW_WIDTH):
@@ -128,6 +137,8 @@ class FrameSink:
         self.export_seconds = max(0.0, min(float(export_seconds), MAX_EXPORT_SECONDS))
         self.due = 0.0
         self.ring = None
+        # 内存上限截短了才有值: (留得下几秒, 一帧多少字节, 宽, 高)
+        self.ring_limit = None
         self.last_src = None
         self.crop_state = {}
         self.crop_count = 0
@@ -153,9 +164,13 @@ class FrameSink:
         if self.export_seconds > 0:
             ring = self.ring
             if ring is None:
-                want = max(1, int(round(self.export_seconds / max(FRAME_INTERVAL, 0.05))))
-                ring = self.ring = collections.deque(
-                    maxlen=max(1, min(want, RING_MEMORY_CAP // max(1, frame_bytes(frame)))))
+                step = max(FRAME_INTERVAL, 0.05)
+                want = max(1, int(round(self.export_seconds / step)))
+                nbytes = frame_bytes(frame)
+                keep = ring_frames(want, nbytes)
+                ring = self.ring = collections.deque(maxlen=keep)
+                if keep < want:
+                    self.ring_limit = (keep * step, nbytes, frame.shape[1], frame.shape[0])
             ring.append((t, frame))
         if self.save_frames:
             media.put(('f', self, t, frame))
@@ -379,12 +394,26 @@ def export_frames(out_dir, sink, frames, team_dir=None):
             buf.tofile(os.path.join(folder, name))
             files.append({'file': name, 't': round(rel, 3)})
     info = {'run': run_name, 'team_dir': team_dir, 'size': size, 'frames': files,
+            'export_seconds': sink.export_seconds,
+            'span': round(files[-1]['t'] - files[0]['t'], 3) if files else 0,
             'judge_test': f"judge_test.py at {team_dir or '<队伍目录>'} --image "
                           + ' '.join(f['file'] for f in files) + ' -e "<表达式>"'}
+    note = ring_limit_note(sink)
+    if note:
+        info['ring_seconds'] = sink.ring_limit[0]
+        info['note'] = note
     with open(os.path.join(folder, 'info.json'), 'w', encoding='utf-8') as f:
         json.dump(info, f, ensure_ascii=False, indent=1)
     _prune_exports(root)
     return folder, files
+
+
+def ring_limit_note(sink):
+    if sink.ring_limit is None:
+        return ''
+    seconds, nbytes, width, height = sink.ring_limit
+    return (f'设的 {sink.export_seconds:g} 秒超过内存上限: {width}x{height} 一帧原图 {nbytes / 1e6:.1f}MB, '
+            f'只留得下最近 {seconds:g} 秒')
 
 
 def _prune_exports(root):

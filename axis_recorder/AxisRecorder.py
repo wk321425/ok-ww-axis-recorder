@@ -1,11 +1,11 @@
 from ok import Logger, TriggerTask
 
-from .media import HOTKEYS, MAX_EXPORT_SECONDS, NO_HOTKEY
+from .media import HOTKEYS, MAX_EXPORT_SECONDS, NO_HOTKEY, RING_GUARANTEE_SECONDS
 from .recorder import HOLDER_ATTR, Recorder, default_out_dir
 
 logger = Logger.get_logger(__name__)
 
-PLUGIN_VERSION = '0.3.0'
+PLUGIN_VERSION = '0.3.1'
 
 # 要打补丁的上游函数, 上游改名或删掉时插件不装, 只报错
 PATCH_POINTS = {
@@ -67,7 +67,9 @@ class AxisRecorderTask(TriggerTask):
             self.CROPS_KEY: '读屏结果变了的那一刻, 把读的那块原图(不缩)存下来, 复盘页点读屏事件能看到',
             self.HOTKEY_KEY: '战斗里按一下, 把最近几秒的原图(不缩)导出到 logs/axis_runs/export, '
                              '拿去离线测判据。插件开着时这个键会被占住',
-            self.EXPORT_SECONDS_KEY: f'原图只在打的时候留在内存里, 2K 每秒约 60MB, 最多 {MAX_EXPORT_SECONDS} 秒',
+            self.EXPORT_SECONDS_KEY: (f'原图只在打的时候留在内存里, 每秒约 1080p 33MB / 2K 59MB / 4K 133MB。'
+                                      f'{RING_GUARANTEE_SECONDS:g} 秒以内任何分辨率都留够, 再长受 320MB 上限管'
+                                      f'(2K 最多 5.5 秒、4K 只有 {RING_GUARANTEE_SECONDS:g} 秒), 最多 {MAX_EXPORT_SECONDS} 秒'),
         }
         self.config_type[self.HOTKEY_KEY] = {'type': 'drop_down', 'options': list(HOTKEYS) + [NO_HOTKEY]}
         try:
