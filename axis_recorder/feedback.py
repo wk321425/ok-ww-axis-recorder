@@ -1,16 +1,20 @@
-"""一键反馈包: 一局的记录、整局画面、这局按 F8 导出的原图、版本信息和这局前后的 ok-ww 日志打成一个 zip。不依赖 Qt。
+"""一键反馈包: 一局的记录、整局画面、这局按 F8 导出的原图、版本信息、这局前后的 ok-ww 日志(可选带上录屏)打成一个 zip。
+不依赖 Qt。
 
-包里的 axis_runs/ 和本地 logs/axis_runs/ 是一个结构, 收到的人解压进去就能在复盘页打开这一局。"""
+收到的人在复盘页点「打开反馈包」: 解压到 <记录目录>/imported/<包名>/, 和本地的记录分开放(不会被开新局时删掉)。"""
 import datetime
 import json
 import os
 import platform
 import re
 import time
+import shutil
 import zipfile
 
 from .media import EXPORT_DIR, MediaIndex, finished_exports, folder_bytes, media_paths
-from .runs import RunData, detail_lines, headline
+from .recorder import RUN_FILE_RE
+from .runs import FEEDBACK_INFO, IMPORT_DIR, RunData, detail_lines, headline
+from .screenrec import VIDEO_EXTS, load_video_info, video_info_path
 
 FEEDBACK_DIR = 'feedback'
 FEEDBACK_KEEP = 10
@@ -22,8 +26,12 @@ CHUNK = 1 << 20
 BUSY_PAUSE = 0.02
 SUMMARY_NAME = '反馈说明.txt'
 LOG_NAME = 'ok-script_这一局.log'
-# JPEG/PNG 已经压过, 再压只费 CPU
-STORED_SUFFIXES = ('.media', '.png', '.jpg')
+VIDEO_DIR = 'video'
+# JPEG/PNG/录屏已经压过, 再压只费 CPU
+STORED_SUFFIXES = ('.media', '.png', '.jpg') + VIDEO_EXTS
+# 打开反馈包: 只留最近几个; 解出来超过这么大不解(防坏包把盘写满)
+IMPORT_KEEP = 10
+IMPORT_MAX_BYTES = 16 << 30
 
 
 def _size(path):
@@ -60,12 +68,19 @@ class FeedbackPlan:
         self.run_path = run_path
         self.out_dir = out_dir
         self.name = os.path.basename(run_path)
-        self.media = [p for p in media_paths(run_path) if os.path.isfile(p)]
+        # 录屏对时结果(<stem>.video.json)跟着整局画面一起带上, 录屏本身太大不带
+        self.media = [p for p in (*media_paths(run_path), video_info_path(run_path)) if os.path.isfile(p)]
         self.frames = len(MediaIndex(run_path).frames) if self.media else 0
         self.exports = run_exports(out_dir, self.name)
         self.export_images = sum(_png_count(f) for f in self.exports)
         self.base_bytes = sum(_size(p) for p in [run_path] + self.media)
         self.export_bytes = sum(folder_bytes(f) for f in self.exports)
+        # 录屏只在本机还在时能带(导入的包里带了录屏也算)
+        video = load_video_info(run_path) or {}
+        path = video.get('path')
+        self.video = path if path and os.path.isfile(path) else None
+        self.video_bytes = _size(self.video) if self.video else 0
+        self.video_duration = video.get('duration')
 
 
 def default_log_path():
@@ -164,11 +179,13 @@ def summary_text(info, run, lap_slot):
                                           f"这局导出过 {info['exports_skipped']} 次, 打包时没带"))
     lines.append(f"{LOG_NAME}  ok-ww 日志 {log['from'][11:19]} ~ {log['to'][11:19]} 共 {log['lines']} 行"
                  if log['lines'] else '日志: 没找到这局的日志(日志文件不在, 或者 ok-ww 关了写日志)')
+    video = info.get('video')
+    if video:
+        lines.append(f"{VIDEO_DIR}/{video['name']}  录屏 {video['bytes'] / 1e6:.0f}MB")
     lines += [
         '',
         '【怎么看】',
-        '把 axis_runs 文件夹解压到 ok-ww 的 logs 下面(和原来的合并), 在「跑轴复盘」页选这一局。',
-        '插件开新局时按时间删旧记录(默认留 50 局, 画面留 5 局): 收到的这局比本地的都旧的话, 看完前别开打, 或者另存一份。',
+        '装了「跑轴记录」插件的话, 在「跑轴复盘」页点「打开反馈包」选这个 zip, 不用自己解压。',
     ]
     return '\n'.join(lines) + '\n'
 
@@ -221,7 +238,7 @@ def _mtime(path):
         return 0.0
 
 
-def build_feedback(plan, note='', with_exports=True, lap_slot=None, log_path=None, busy=None):
+def build_feedback(plan, note='', with_exports=True, lap_slot=None, log_path=None, busy=None, with_video=False):
     """打成 <记录目录>/feedback/<这局>_反馈.zip, 返回路径。busy() 为真(轴开打了)时每写一块歇一下。"""
     run = RunData(plan.run_path)
     header = run.header
@@ -240,6 +257,8 @@ def build_feedback(plan, note='', with_exports=True, lap_slot=None, log_path=Non
         'os': platform.platform(), 'frames': plan.frames,
         'exports': [_export_info(f) for f in exports], 'exports_skipped': len(plan.exports) - len(exports),
         'log': {'from': _stamp(wall0 - LOG_MARGIN), 'to': _stamp(wall1 + LOG_MARGIN), 'lines': len(log_lines)},
+        'video': ({'name': os.path.basename(plan.video), 'bytes': plan.video_bytes}
+                  if with_video and plan.video else None),
     }
 
     def pause():
@@ -261,6 +280,8 @@ def build_feedback(plan, note='', with_exports=True, lap_slot=None, log_path=Non
                 for name in sorted(os.listdir(export)):
                     _add(zf, os.path.join(export, name), f'axis_runs/{EXPORT_DIR}/{os.path.basename(export)}/{name}',
                          pause)
+            if info['video']:
+                _add(zf, plan.video, f"{VIDEO_DIR}/{info['video']['name']}", pause)
         os.replace(part, path)
     except BaseException:
         try:
@@ -270,3 +291,90 @@ def build_feedback(plan, note='', with_exports=True, lap_slot=None, log_path=Non
         raise
     _prune(folder)
     return path
+
+
+# ---------- 打开反馈包 ----------
+
+def _member_path(name):
+    """包里的路径 -> 解压后的相对路径; 不是反馈包该有的东西(或者想跳出文件夹)返回 None。"""
+    parts = name.replace('\\', '/').split('/')
+    if not parts[-1] or any(p in ('', '.', '..') or ':' in p for p in parts):
+        return None
+    if len(parts) == 1:
+        return parts[0] if parts[0] in (SUMMARY_NAME, FEEDBACK_INFO, LOG_NAME) else None
+    if parts[0] == 'axis_runs' and (len(parts) == 2 or (len(parts) == 4 and parts[1] == EXPORT_DIR)):
+        return os.path.join(*parts)
+    if parts[0] == VIDEO_DIR and len(parts) == 2 and parts[1].lower().endswith(VIDEO_EXTS):
+        return os.path.join(*parts)
+    return None
+
+
+def import_feedback(zip_path, out_dir, busy=None):
+    """解压到 <out_dir>/imported/<包名>/, 返回里面那一局的 .jsonl。同一个包再开一次就重新解。"""
+    def pause():
+        if busy is not None and busy():
+            time.sleep(BUSY_PAUSE)
+
+    stem = re.sub(r'[^\w.-]+', '_', os.path.splitext(os.path.basename(zip_path))[0]) or 'feedback'
+    root = os.path.join(out_dir, IMPORT_DIR)
+    dest = os.path.join(root, stem)
+    part = dest + '.part'
+    with zipfile.ZipFile(zip_path) as zf:
+        members = [(info, _member_path(info.filename)) for info in zf.infolist() if not info.is_dir()]
+        members = [(info, rel) for info, rel in members if rel]
+        runs = [rel for _, rel in members
+                if os.path.dirname(rel) == 'axis_runs' and RUN_FILE_RE.match(os.path.basename(rel))]
+        if not runs:
+            raise ValueError('这个 zip 里没有跑轴记录(不是「打包反馈」打出来的?)')
+        total = sum(info.file_size for info, _ in members)
+        if total > IMPORT_MAX_BYTES:
+            raise ValueError(f'解出来有 {total / 1e9:.1f}GB, 太大了, 没解')
+        shutil.rmtree(part, ignore_errors=True)
+        try:
+            for info, rel in members:
+                target = os.path.join(part, rel)
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                with zf.open(info) as src, open(target, 'wb') as out:
+                    while True:
+                        chunk = src.read(CHUNK)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+                        pause()
+            shutil.rmtree(dest, ignore_errors=True)
+            os.replace(part, dest)
+        except BaseException:
+            shutil.rmtree(part, ignore_errors=True)
+            raise
+    run_path = os.path.join(dest, sorted(runs)[-1])
+    _relink_video(run_path, os.path.join(dest, VIDEO_DIR))
+    _prune_imports(root, keep=dest)
+    return run_path
+
+
+def _relink_video(run_path, video_dir):
+    """包里带了录屏: 对时结果里的路径是对方电脑上的, 改成解出来的这份。"""
+    info = load_video_info(run_path)
+    if not info or not info.get('path'):
+        return
+    local = os.path.join(video_dir, os.path.basename(info['path'].replace('\\', '/')))
+    if not os.path.isfile(local):
+        return
+    info.setdefault('orig_path', info['path'])
+    info['path'] = local
+    with open(video_info_path(run_path), 'w', encoding='utf-8') as f:
+        json.dump(info, f, ensure_ascii=False, indent=1)
+
+
+def _prune_imports(root, keep):
+    try:
+        folders = [e.path for e in os.scandir(root) if e.is_dir()]
+    except OSError:
+        return
+    for folder in folders:
+        if folder.endswith('.part') and folder != keep:
+            shutil.rmtree(folder, ignore_errors=True)
+    folders = sorted((f for f in folders if not f.endswith('.part')), key=_mtime)
+    for folder in folders[:max(0, len(folders) - IMPORT_KEEP)]:
+        if os.path.normcase(folder) != os.path.normcase(keep):
+            shutil.rmtree(folder, ignore_errors=True)

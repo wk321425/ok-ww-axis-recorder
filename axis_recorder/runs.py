@@ -5,12 +5,16 @@ import os
 import statistics
 
 from .recorder import list_run_files
+from .screenrec import TOOL_NAMES, format_clock, load_video_info
 
 KEY_ROLES = {'Resonance Key': 'E', 'Liberation Key': 'R', 'Echo Key': 'Q', 'Tool Key': 'T'}
 DEFAULT_KEYS = {'e': 'E', 'r': 'R', 'q': 'Q', 't': 'T'}
 SPECIAL_KEYS = {'space': '跳', 'f': 'F', 'shift': '闪', 'lshift': '闪', 'esc': 'Esc', 'tab': 'Tab'}
 MOUSE_LABELS = {'left': 'A', 'right': '右键', 'middle': '中键', 'wheel': '滚轮'}
 HUD_HIDDEN = -1
+# 打开的反馈包解压到 <记录目录>/imported/<包名>/, 里面一份 axis_runs/ 和对方的 feedback.json
+IMPORT_DIR = 'imported'
+FEEDBACK_INFO = 'feedback.json'
 # 按下到松开不到这么久算点按(轴里的普攻是按住几十毫秒的 tap), 不画成「按住」
 TAP_MAX = 0.2
 # 同一个键隔这么近接着按算连按(切人键、R 会一直按到生效), 时间线上合成一个 ×N
@@ -22,6 +26,10 @@ def char_label(char):
     if name and name.startswith('char_') and char.get('cls') not in (None, '', 'BaseChar'):
         return char['cls']  # 0.1.0 记的是模板名
     return name
+
+
+def is_manual(header):
+    return header.get('mode') == 'manual' or header.get('tool') == 'key_recorder'
 
 
 class RunSummary:
@@ -40,6 +48,15 @@ class RunSummary:
     @property
     def team(self):
         return [char_label(c) if c else '-' for c in self.header.get('team') or ()]
+
+    @property
+    def manual(self):
+        """人手打的: 插件人为操作模式记的, 或者 WWKeyRecorder 记的。"""
+        return is_manual(self.header)
+
+    @property
+    def imported(self):
+        return import_root(self.path) is not None
 
     @property
     def duration(self):
@@ -90,6 +107,37 @@ def summarize_run(path):
 def list_runs(out_dir):
     runs = [summarize_run(path) for path in list_run_files(out_dir)]
     return [run for run in reversed(runs) if run is not None]
+
+
+def import_root(path):
+    """<记录目录>/imported/<包名>/axis_runs/<局>.jsonl -> 那个包的文件夹; 本地记的局返回 None。"""
+    folder = os.path.dirname(os.path.abspath(path))
+    pack = os.path.dirname(folder)
+    if os.path.basename(folder) == 'axis_runs' and os.path.basename(os.path.dirname(pack)) == IMPORT_DIR:
+        return pack
+    return None
+
+
+def list_imported_runs(out_dir):
+    """打开过的反馈包里的局, 最近打开的在前。"""
+    try:
+        packs = sorted((e.path for e in os.scandir(os.path.join(out_dir, IMPORT_DIR))
+                        if e.is_dir() and not e.name.endswith('.part')), key=os.path.getmtime, reverse=True)
+    except OSError:
+        return []
+    runs = [summarize_run(path) for pack in packs for path in reversed(list_run_files(os.path.join(pack, 'axis_runs')))]
+    return [run for run in runs if run is not None]
+
+
+def load_feedback_info(path):
+    root = import_root(path)
+    if root is None:
+        return None
+    try:
+        with open(os.path.join(root, FEEDBACK_INFO), encoding='utf-8') as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
 
 
 class InputMark:
@@ -178,6 +226,8 @@ class RunData:
                 self.key_labels[str(key).lower()] = label
         self.field = self._field_spans()
         self._field_starts = [span.t0 for span in self.field]
+        self.video = load_video_info(path)
+        self.feedback = load_feedback_info(path)
         self.perform = self._perform_spans()
         self.inputs, self.holds = self._inputs()
         self.input_groups = self._group_inputs()
@@ -474,6 +524,10 @@ def describe(run, event):
             extras.append(f"线程 {event['th']}")
         if event.get('si'):
             extras.append('SendInput')
+        if event.get('cut'):
+            extras.append('收尾/切出游戏时还按着')
+        if event.get('lag'):
+            extras.append(f"晚到 {event['lag']}ms, 时刻不准")
         if extras:
             text += '  (' + ', '.join(extras) + ')'
         return '按键', text
@@ -520,9 +574,56 @@ def lap_line(run, lap_slot):
             f'  (平均 {sum(durations) / len(durations):.2f}s)')
 
 
+def video_pending(run):
+    """这局要录屏, 但对时结果还没写出来(打完后一两分钟)。"""
+    return bool(run.header.get('rec')) and run.video is None
+
+
+def video_offset(run):
+    video = run.video or {}
+    return video.get('offset') if video.get('path') else None
+
+
+def video_clock(run, t):
+    """记录里 t 秒对应录屏的哪一刻; 没录屏返回 None。"""
+    offset = video_offset(run)
+    if offset is None:
+        return None
+    at = t + offset
+    duration = (run.video or {}).get('duration') or 0
+    if at < 0 or (duration and at > duration):
+        return '录屏里没有这一刻'
+    return f'录屏 {format_clock(at)}'
+
+
+def video_line(run):
+    video = run.video
+    if video is None:
+        if video_pending(run):
+            rec = run.header['rec']
+            return f"录屏: {TOOL_NAMES.get(rec.get('tool'), rec.get('tool'))} 打完后在找录屏文件、对时(一两分钟)"
+        return None
+    if video_offset(run) is None:
+        return f"录屏: {video.get('method')}: {video.get('note', '')}"
+    line = (f"录屏: {os.path.basename(video['path'])}  ·  录屏秒 = 记录秒 {video['offset']:+.3f}"
+            f"({video.get('method')})")
+    if video.get('note'):
+        line += f"\n    {video['note']}"
+    return line
+
+
 def headline(run, lap_slot=None):
     """页面上常驻的一行; 其余的放悬停提示(detail_lines)。"""
     parts = [f'总时长 {run.duration:.2f}s', f'结束: {run.reason}']
+    if run.header.get('note'):
+        parts.insert(0, f"备注: {run.header['note']}")
+    if run.feedback is not None:
+        note = ' / '.join(line.strip() for line in str(run.feedback.get('note') or '').splitlines() if line.strip())
+        parts.insert(0, f'反馈: {note}' if note else '导入的反馈包(没写哪里不对)')
+    if video_offset(run) is not None:
+        parts.append(f"录屏 {run.video['offset']:+.2f}s({run.video.get('method')})")
+    elif run.video is not None or video_pending(run):
+        parts.append('录屏对时中' if run.video is None else f"录屏 {run.video.get('method')}")
     lap = lap_line(run, lap_slot)
     if lap:
         parts.append(lap)
@@ -536,12 +637,25 @@ def detail_lines(run):
     unseen = run.unseen_time(HUD_HIDDEN)
     team_ver = f" v{header['team_ver']}" if header.get('team_ver') else ''
     size = header.get('size')
+    task = header.get('task', '')
+    if header.get('by'):
+        task += f"({header['by']}开的局)"
     lines = [
         f"{header.get('team_dir') or ' / '.join(run.char_name(i) for i in sorted(run.names))}{team_ver}"
-        f"  ·  {header.get('task', '')}" + (f"  ·  {size[0]}x{size[1]}" if size else ''),
+        f"  ·  {task}" + (f"  ·  {size[0]}x{size[1]}" if size else ''),
         f"HUD 不在 {run.hud_hidden_time():.2f}s" + (f"(其中 {unseen:.2f}s 轴没在看)" if unseen >= 0.05 else ''),
         f"按键 {len(run.inputs)}  ·  读屏 {sum(r.count for r in run.reads)} 次({len(run.reads)} 处)  ·  日志 {len(run.logs)}",
     ]
+    end = run.end or {}
+    if end.get('pauses'):
+        lines.append(f"鸣潮切出去 {end['pauses']} 次, 一共 {end.get('paused', 0):.1f}s(这几段不记按键)")
+    video = video_line(run)
+    if video:
+        lines.append(video)
+    feedback = run.feedback
+    if feedback is not None:
+        lines.append(f"反馈包: {feedback.get('packed', '?')} 打的  ·  ok-ww {feedback.get('ok_ww') or '?'}  ·  "
+                     f"插件 v{feedback.get('plugin_packed') or '?'}  ·  {feedback.get('os') or '?'}")
     stats = run.char_stats()
     if stats:
         def keys(s):

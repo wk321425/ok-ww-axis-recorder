@@ -1,7 +1,7 @@
 {
   "file_name": "axis_recorder",
   "script_name": "跑轴记录",
-  "version": "0.3.1",
+  "version": "0.4.4",
   "tasks": [
     ["AxisRecorder", "AxisRecorderTask"]
   ],

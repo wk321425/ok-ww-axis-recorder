@@ -12,10 +12,12 @@ from PySide6.QtGui import QBrush, QColor, QFont, QFontMetrics, QImage, QPainter,
 from PySide6.QtWidgets import QAbstractItemView, QFrame, QHBoxLayout, QHeaderView, QSizePolicy, QSplitter, \
     QStackedWidget, QTableWidgetItem, QToolTip, QVBoxLayout, QWidget
 
-from .feedback import FEEDBACK_DIR, FeedbackPlan, build_feedback
+from .feedback import FEEDBACK_DIR, FeedbackPlan, build_feedback, import_feedback
 from .media import EXPORT_DIR, MediaIndex, clear_exports, export_usage
 from .recorder import HOLDER_ATTR, default_out_dir
-from .runs import HUD_HIDDEN, RunData, Span, describe, detail_lines, headline, list_runs, source_text
+from .runs import (HUD_HIDDEN, RunData, Span, describe, detail_lines, headline, import_root, list_imported_runs,
+                   list_runs, source_text, video_clock, video_pending)
+from .screenrec import load_video_info, video_info_path
 
 try:
     # Fluent 控件才跟得上 ok-ww 的深色主题; 没装 qfluentwidgets 的环境退回 Qt 原生控件。
@@ -35,6 +37,9 @@ except Exception:
 LABEL_W = 210
 RULER_H = 24
 PREFS_FILE = '_tab_prefs.json'
+# 每 0.5 秒看一眼是不是刚收尾(刚收尾马上刷新), 平时 3 秒读一次盘
+TICK_MS = 500
+REFRESH_TICKS = 6
 SLOT_COLORS = ['#4C8DF6', '#F28C38', '#3DB37A', '#B05CD6']
 HIDDEN_COLOR = '#8A8A8A'
 KEY_COLORS = {'E': '#20A4A4', 'R': '#E04848', 'Q': '#8E5BD8', 'F': '#D4A017', 'T': '#6B8E23'}
@@ -645,6 +650,7 @@ class FramePanel(QWidget):
         self.run = None
         self.media = None
         self.index = -1
+        self.t = 0.0
         self.boxed = []
         self._cache = collections.OrderedDict()
         layout = QVBoxLayout(self)
@@ -702,14 +708,21 @@ class FramePanel(QWidget):
         index = max(0, min(len(self.media.frames) - 1, self.index + delta))
         self.stepped.emit(self.media.frames[index]['t'])
 
+    def refresh_caption(self):
+        if self.has_frames() and self.index >= 0:
+            self._show(self.index, self.t)
+
     def _show(self, index, t):
         frames = self.media.frames
-        self.index = index
+        self.index, self.t = index, t
         entry = frames[index]
         caption = f"画面 {entry['t']:.2f}s"
         if t - entry['t'] > 0.02:
             caption += f'(光标 {t:.2f}s)'
         caption += f'   {index + 1}/{len(frames)}'
+        clock = video_clock(self.run, t) if self.run is not None else None
+        if clock:
+            caption += f'   ·  {clock}'  # 剪视频时拿这个时间去录屏里找
         gap = (frames[index + 1]['t'] if index + 1 < len(frames) else t) - entry['t']
         if gap > FRAME_GAP_NOTE and t - entry['t'] > FRAME_GAP_NOTE / 2:
             # 画面是轴自己取的帧: 定时连点、等演出这类不读屏的时候就没有, 别把旧帧当成那一刻
@@ -849,8 +862,9 @@ class EventModel(QAbstractTableModel):
 
 
 class AxisRecorderTab(QWidget):
-    # 打包线程做完发回界面线程: zip 路径, 出错时是异常
+    # 打包/解包线程做完发回界面线程: zip 路径(解包是那一局的路径), 出错时是异常
     packed = Signal(object)
+    unpacked = Signal(object)
 
     def __init__(self, out_dir=None):
         super().__init__()
@@ -864,19 +878,29 @@ class AxisRecorderTab(QWidget):
         self.summaries = []
         self._listing = None
         self._packing = False
+        self._unpacking = False
+        self._was_recording = False
+        self._refresh_due = REFRESH_TICKS
         self.last_feedback = None
         self.packed.connect(self._on_packed)
+        self.unpacked.connect(self._on_unpacked)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 12, 16, 12)
+        # 两行: 上面选哪一局, 下面是这一局的操作。挤在一行时窗口一窄 Qt 就把按钮叠到下拉框上
         top = QHBoxLayout()
         self.run_box = ComboBox()
-        self.run_box.setMinimumWidth(460)
+        self.run_box.setMinimumWidth(420)
+        self.run_box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.run_box.currentIndexChanged.connect(self._on_run_selected)
         refresh = PushButton('刷新')
         refresh.clicked.connect(lambda: self.refresh(force=True))
         folder = PushButton('打开文件夹')
         folder.clicked.connect(self._open_folder)
+        self.import_button = PushButton('打开反馈包')
+        self.import_button.clicked.connect(self._open_feedback)
+        self.import_button.setToolTip('选别人发来的反馈包 zip, 解压到记录目录下的 imported 文件夹(只留最近 10 个)直接打开看,\n'
+                                      '和本地记录分开放, 开新局时不会被删')
         self.pack_button = PushButton('打包反馈')
         self.pack_button.clicked.connect(self._pack_feedback)
         self.clear_button = PushButton('清空导出原图')
@@ -891,12 +915,20 @@ class AxisRecorderTab(QWidget):
         self.zoom.setValue(60)
         self.zoom.setFixedWidth(140)
         self.zoom.valueChanged.connect(lambda v: self.canvas.set_zoom(float(v)))
-        for widget in (self.run_box, refresh, folder, self.pack_button, self.clear_button, self.follow,
-                       BodyLabel('分圈按'), self.lap_box,
-                       BodyLabel('缩放'), self.zoom):
+        # 按钮和勾选框按自己的字宽固定, 窄了只缩下拉框(它按最长那一项要宽度, 不固定的话会把旁边的字挤掉)
+        for widget in (self.follow, refresh, folder, self.import_button, self.pack_button, self.clear_button):
+            widget.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        top.addWidget(self.run_box, 1)
+        for widget in (self.follow, refresh, self.import_button):
             top.addWidget(widget)
-        top.addStretch(1)
         layout.addLayout(top)
+        actions = QHBoxLayout()
+        for widget in (BodyLabel('分圈按'), self.lap_box, BodyLabel('缩放'), self.zoom):
+            actions.addWidget(widget)
+        actions.addStretch(1)
+        for widget in (self.pack_button, folder, self.clear_button):
+            actions.addWidget(widget)
+        layout.addLayout(actions)
 
         # 常驻一行, 队伍/分辨率/按键读屏次数/各角色统计放悬停提示
         self.summary = BodyLabel()
@@ -993,7 +1025,7 @@ class AxisRecorderTab(QWidget):
         layout.addWidget(main, 1)
 
         self.timer = QTimer(self)
-        self.timer.setInterval(3000)
+        self.timer.setInterval(TICK_MS)
         self.timer.timeout.connect(self._tick)
         self.timer.start()
         self.refresh(force=True)
@@ -1015,7 +1047,13 @@ class AxisRecorderTab(QWidget):
 
     def _tick(self):
         # 这页和轴在同一个进程里抢 GIL: 人在游戏里(ok-ww 不是前台窗口)或者正打着, 都不读盘
-        if self.isVisible() and self.window().isActiveWindow() and not self._recording():
+        recording = self._recording()
+        if self._was_recording and not recording:
+            self._refresh_due = 0  # 一局刚收尾, 能刷就马上刷, 别让人以为还在录
+        self._was_recording = recording
+        self._refresh_due -= 1
+        if self._refresh_due <= 0 and not recording and self.isVisible() and self.window().isActiveWindow():
+            self._refresh_due = REFRESH_TICKS
             self.refresh()
 
     @staticmethod
@@ -1029,7 +1067,12 @@ class AxisRecorderTab(QWidget):
 
     def refresh(self, force=False):
         self._update_export_button()
-        summaries = list_runs(self.out_dir)
+        run = self.run
+        if run is not None and video_pending(run) and os.path.isfile(video_info_path(run.path)):
+            run.video = load_video_info(run.path)  # 打完一两分钟后对时结果才写出来
+            self._update_summary()
+            self.frame_panel.refresh_caption()
+        summaries = list_runs(self.out_dir) + list_imported_runs(self.out_dir)
         listing = [(s.path, s.finished, round(s.duration, 1)) for s in summaries]
         if not force and listing == self._listing:
             return
@@ -1043,7 +1086,8 @@ class AxisRecorderTab(QWidget):
             stamp = summary.name[:15]
             when = f'{stamp[4:6]}-{stamp[6:8]} {stamp[9:11]}:{stamp[11:13]}:{stamp[13:15]}'
             state = '' if summary.finished else '  (进行中)'
-            _add_item(self.run_box, f"{when}  {' / '.join(summary.team)}  {summary.duration:.1f}s  "
+            kind = ('[导入] ' if summary.imported else '') + ('[手打] ' if summary.manual else '')
+            _add_item(self.run_box, f"{when}  {kind}{' / '.join(summary.team)}  {summary.duration:.1f}s  "
                                     f"{summary.reason}{state}", summary.path)
         self.run_box.blockSignals(False)
         target = current
@@ -1111,6 +1155,9 @@ class AxisRecorderTab(QWidget):
     def _save_pref(self, slot):
         prefs = self._prefs()
         prefs[self._team_key()] = slot
+        self._write_prefs(prefs)
+
+    def _write_prefs(self, prefs):
         try:
             os.makedirs(self.out_dir, exist_ok=True)
             with open(os.path.join(self.out_dir, PREFS_FILE), 'w', encoding='utf-8') as f:
@@ -1227,11 +1274,56 @@ class AxisRecorderTab(QWidget):
             self.frame_panel.show_event(self.model.events[row])
 
     def _open_folder(self):
-        os.makedirs(self.out_dir, exist_ok=True)
+        # 看的是导入的反馈包就打开那个包解出来的文件夹(反馈说明、日志都在里面)
+        folder = (import_root(self.run.path) if self.run is not None else None) or self.out_dir
+        os.makedirs(folder, exist_ok=True)
         try:
-            os.startfile(self.out_dir)
+            os.startfile(folder)
         except Exception:
             pass
+
+    # ---------- 打开反馈包 ----------
+
+    def _open_feedback(self):
+        if self._unpacking:
+            return
+        from PySide6.QtWidgets import QFileDialog
+        prefs = self._prefs()
+        start = prefs.get('_import_dir') or os.path.join(os.path.expanduser('~'), 'Downloads')
+        path, _ = QFileDialog.getOpenFileName(self, '打开反馈包', start, '反馈包 (*.zip)')
+        if not path:
+            return
+        prefs['_import_dir'] = os.path.dirname(path)
+        self._write_prefs(prefs)
+        self._unpacking = True
+        self.import_button.setEnabled(False)
+        self.import_button.setText('解压中…')
+        threading.Thread(target=self._unpack_worker, args=(path,), name='axis_recorder_import', daemon=True).start()
+
+    def _unpack_worker(self, path):
+        try:
+            result = import_feedback(path, self.out_dir, busy=self._recording)
+        except Exception as e:
+            result = e
+        try:
+            self.unpacked.emit(result)
+        except RuntimeError:
+            pass
+
+    def _on_unpacked(self, result):
+        self._unpacking = False
+        self.import_button.setEnabled(True)
+        self.import_button.setText('打开反馈包')
+        if isinstance(result, Exception):
+            self._toast('error', '打不开这个反馈包', str(result))
+            return
+        # 看别人的局时别被新打的局切走
+        self.follow.setChecked(False)
+        self.refresh(force=True)
+        index = next((i for i, s in enumerate(self.summaries) if s.path == result), -1)
+        if index >= 0:
+            self.run_box.setCurrentIndex(index)
+        self.load(result)
 
     def _update_export_button(self):
         count, size = export_usage(self.out_dir)
@@ -1262,7 +1354,7 @@ class AxisRecorderTab(QWidget):
     def _update_pack_button(self):
         self.pack_button.setText('打包中…' if self._packing else '打包反馈')
         self.pack_button.setEnabled(self.run is not None and not self._packing)
-        self.pack_button.setToolTip('把选中的这一局(记录、整局画面、这局 F8 导出的原图、版本、前后的 ok-ww 日志)打成一个 zip\n'
+        self.pack_button.setToolTip('把选中的这一局(记录、整局画面、这局 F8 导出的原图、版本、前后的 ok-ww 日志, 可选带上录屏)打成一个 zip\n'
                                     f'存在 {os.path.join(self.out_dir, FEEDBACK_DIR)}, 留最近 10 个')
 
     def _pack_feedback(self):
@@ -1276,16 +1368,17 @@ class AxisRecorderTab(QWidget):
         except Exception as e:
             self._toast('error', '打包失败', str(e))
             return
-        accepted, note, with_exports = self._ask_feedback(plan)
+        accepted, note, with_exports, with_video = self._ask_feedback(plan)
         if not accepted:
             return
         self._packing = True
         self._update_pack_button()
-        threading.Thread(target=self._pack_worker, args=(plan, note, with_exports, self.lap_box.currentData()),
+        threading.Thread(target=self._pack_worker,
+                         args=(plan, note, with_exports, self.lap_box.currentData(), with_video),
                          name='axis_recorder_feedback', daemon=True).start()
 
     def _ask_feedback(self, plan):
-        """返回 (打不打, 哪里不对, 带不带导出原图)。"""
+        """返回 (打不打, 哪里不对, 带不带导出原图, 带不带录屏)。"""
         stamp = plan.name[:15]
         when = f'{stamp[4:6]}-{stamp[6:8]} {stamp[9:11]}:{stamp[11:13]}:{stamp[13:15]}'
         team = ' / '.join(self.run.char_name(i) for i in sorted(self.run.names))
@@ -1302,6 +1395,12 @@ class AxisRecorderTab(QWidget):
                              f'{plan.export_bytes / 1e6:.0f}MB)')
             check.setChecked(True)
             widgets.append(check)
+        video_check = None
+        if plan.video:
+            length = f' · {plan.video_duration:.0f}s' if plan.video_duration else ''
+            video_check = CheckBox(f'带上录屏 {os.path.basename(plan.video)}({plan.video_bytes / 1e6:.0f}MB{length})')
+            video_check.setToolTip('录屏很大, 对方要看画面细节时再带; 不带的话对方也能看到每一刻对应的录屏时间')
+            widgets.append(video_check)
         if MessageBoxBase is not None:
             box = MessageBoxBase(self.window())
             box.viewLayout.addWidget(SubtitleLabel('打包反馈'))
@@ -1323,11 +1422,12 @@ class AxisRecorderTab(QWidget):
             buttons.rejected.connect(box.reject)
             layout.addWidget(buttons)
             accepted = box.exec() == QDialog.Accepted
-        return accepted, note.toPlainText(), check is not None and check.isChecked()
+        return (accepted, note.toPlainText(), check is not None and check.isChecked(),
+                video_check is not None and video_check.isChecked())
 
-    def _pack_worker(self, plan, note, with_exports, lap_slot):
+    def _pack_worker(self, plan, note, with_exports, lap_slot, with_video=False):
         try:
-            result = build_feedback(plan, note, with_exports, lap_slot, busy=self._recording)
+            result = build_feedback(plan, note, with_exports, lap_slot, busy=self._recording, with_video=with_video)
         except Exception as e:
             result = e
         try:

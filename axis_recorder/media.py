@@ -118,6 +118,9 @@ def _same_reading(kind, value, last):
 
 
 def _jsonable(value):
+    item = getattr(value, 'item', None)
+    if item is not None and getattr(value, 'ndim', None) == 0:
+        value = item()  # numpy 标量
     if value is None or isinstance(value, (bool, int, str)):
         return value
     if isinstance(value, float):
@@ -265,10 +268,14 @@ class MediaWriter:
                     logger.error('跑轴记录: 存画面出错', e)
             now = time.monotonic()
             for sink in tuple(self.sinks):
-                if sink.ended:
-                    self._close(sink)
-                elif now - sink.flushed_at >= FLUSH_EVERY:
-                    self._flush(sink, now)
+                try:
+                    if sink.ended:
+                        self._close(sink)
+                    elif now - sink.flushed_at >= FLUSH_EVERY:
+                        self._flush(sink, now)
+                except Exception as e:
+                    self.error = e
+                    logger.error('跑轴记录: 存画面出错', e)
             if self.stopping:
                 break
         for sink in tuple(self.sinks):
@@ -343,11 +350,13 @@ class MediaWriter:
     @staticmethod
     def _append(sink, buf, entry):
         data = buf.tobytes()
-        sink.handle.write(data)
         entry['o'] = sink.offset
         entry['n'] = len(data)
+        # 索引那行先拼好: 拼不出来时数据也别写, 不然后面每条的偏移都错
+        line = json.dumps(entry, ensure_ascii=False, separators=(',', ':'), default=str) + '\n'
+        sink.handle.write(data)
         sink.offset += len(data)
-        sink.index.write(json.dumps(entry, ensure_ascii=False, separators=(',', ':')) + '\n')
+        sink.index.write(line)
 
 
 def prune_media(out_dir, run_paths, keep):
@@ -470,10 +479,11 @@ def clear_exports(out_dir):
 class HotkeyThread(threading.Thread):
     """RegisterHotKey 只认注册它的线程的消息队列, 所以单开一个线程注册和收消息; 设置改了自动换键。"""
 
-    def __init__(self, get_key, on_press):
+    def __init__(self, get_key, on_press, label='导出原图'):
         super().__init__(name='axis_recorder_hotkey', daemon=True)
         self.get_key = get_key
         self.on_press = on_press
+        self.label = label
         self.stop_event = threading.Event()
         self.current = None
         self.bound = False
@@ -501,7 +511,7 @@ class HotkeyThread(threading.Thread):
                         try:
                             self.on_press()
                         except Exception as e:
-                            logger.error('跑轴记录: 导出出错', e)
+                            logger.error(f'跑轴记录: {self.label}热键出错', e)
                 self.stop_event.wait(0.1)
         finally:
             if self.bound:
@@ -519,7 +529,7 @@ class HotkeyThread(threading.Thread):
         if user32.RegisterHotKey(None, HOTKEY_ID, spec[0] | MOD_NOREPEAT, spec[1]):
             self.bound = True
         else:
-            logger.warning(f'跑轴记录: 导出热键 {wanted} 注册不上(多半被别的程序占了), 在设置里换一个')
+            logger.warning(f'跑轴记录: {self.label}热键 {wanted} 注册不上(多半被别的程序占了), 在设置里换一个')
 
 
 class MediaIndex:

@@ -17,6 +17,8 @@ from pathlib import Path
 
 from ok import Logger
 
+from .manual import ManualDriver
+from .screenrec import video_info_path
 from .media import (HOTKEYS, RING_IDLE_KEEP, FrameSink, HotkeyThread, MediaWriter, export_frames, prune_media,
                     ring_limit_note)
 
@@ -53,8 +55,19 @@ GROUP_TOLERANCE = {'color': 0.03, 'con': 0.02}
 
 ORIGIN_MAX_WALK = 24
 WRITER_YIELD_EVERY = 16
+# 战斗任务不在跑、这么久也没再判过战斗, 就当这局没人收尾了
+TASK_STOPPED_END = 3.0
+# 战斗任务被关掉后这局最多再开这么久: 正常关掉是抛 TaskDisabledException 走 reset_to_false, 几毫秒就收了,
+# 让它先收, 轴接住异常打的那行日志(时间线)才记得进这局
+TASK_DISABLED_END = 0.5
+TASK_DISABLED_REASON = '战斗任务被关掉了(手动关闭或出错被停用, 看日志)'
+# ok-ww 的开始/停止(按钮或快捷键)只是让执行器暂停, 自动战斗开关不动: 停这么久就收
+TASK_PAUSED_END = 1.0
+TASK_PAUSED_REASON = 'ok-ww 停止了(执行器暂停)'
 
-_START, _END, _INPUT, _SENDINPUT, _FIELD, _PERF, _READ, _LOG, _MARK = range(9)
+_START, _END, _INPUT, _SENDINPUT, _FIELD, _PERF, _READ, _LOG, _MARK, _RAW = range(10)
+
+MANUAL_TASK_NAME = '手打记录'
 _STOP = object()
 
 MOUSE_FLAGS = {
@@ -237,12 +250,18 @@ class _LogTap(logging.Handler):
 
 
 class Run:
-    """一局。只在执行器线程里创建和结束, 后台线程只读它的时间基准。"""
+    """一局。在执行器线程里创建, 后台线程只读它的时间基准。
 
-    def __init__(self, task, reads, logs):
+    manual: 人为操作模式的一局(task 是 None); by 是怎么开的局; t0 可以往前挪(把开局前那几下按键算进来)。
+    """
+
+    def __init__(self, task, reads, logs, t0=None, manual=False, by=None):
         self.task = task
-        self.t0 = time.perf_counter()
-        self.wall0 = time.time()
+        now = time.perf_counter()
+        self.t0 = now if t0 is None else t0
+        self.wall0 = time.time() - (now - self.t0)
+        self.manual = manual
+        self.by = by
         self.thread = threading.get_ident()
         self.reads = reads
         self.logs = logs
@@ -250,6 +269,10 @@ class Run:
         self.field_seen = None
         self.path = None
         self.team_dir = None
+        # 这局的任务最后一次判战斗(in_combat)的时刻; 写盘线程第一次看到任务被关掉的时刻
+        self.checked_at = self.t0
+        self.disabled_at = None
+        self.paused_at = None
 
 
 class _Group:
@@ -289,6 +312,7 @@ class Recorder:
         self._auto_combat = None
         self._interaction_base = None
         self._error_logged_at = 0.0
+        self._end_lock = threading.Lock()
         # 画面: 正在录的这局、刚打完那局(热键还能导出)、后台编码线程、热键线程
         self.sink = None
         self.idle_sink = None
@@ -297,6 +321,7 @@ class Recorder:
         self.hotkey = None
         self.last_export = None
         self._exporting = False
+        self.manual = ManualDriver(self)
 
     # ---------- 安装 / 卸载 ----------
 
@@ -337,14 +362,25 @@ class Recorder:
         logging.getLogger('ok').addHandler(self._log_tap)
         self._patch_frames()
 
+        self._start_writer()
+        setattr(ExecutorOperation, HOLDER_ATTR, self)
+
+    def _start_writer(self):
         self._writer = threading.Thread(target=self._writer_loop, name='axis_recorder_writer', daemon=True)
         self._writer.start()
-        setattr(ExecutorOperation, HOLDER_ATTR, self)
+
+    def _ensure_writer(self):
+        """写盘线程意外退出了就重起一个: 不然之后每局都只进队列不落盘。"""
+        writer = self._writer
+        if writer is not None and not writer.is_alive():
+            logger.error('跑轴记录: 写盘线程退出了, 重新起一个(上一局的记录可能不完整)')
+            self._start_writer()
 
     def uninstall(self, reason='插件卸载'):
         from ok.task.task import ExecutorOperation
         if self.run is not None:
             self.end_run(reason)
+        self.manual.stop()
         self.idle_sink = None
         if self.hotkey is not None:
             self.hotkey.stop()
@@ -524,8 +560,10 @@ class Recorder:
 
     def should_record(self, task):
         owner = self.owner
-        if owner is None or not owner.enabled:
+        if owner is None or not owner.enabled or getattr(owner, 'manual_mode', False):
             return False
+        if not getattr(task, 'enabled', True):
+            return False  # 自动战斗关了轴却还在跑(停止信号被队伍代码吞了)
         if isinstance(task, self._auto_combat):
             return True
         return bool(owner.config.get(owner.ALL_TASKS_KEY, False))
@@ -533,11 +571,20 @@ class Recorder:
     def observe_combat(self, task):
         inside = bool(getattr(task, '_in_combat', False))
         run = self.run
+        if run is not None and run.task is task:
+            run.checked_at = time.perf_counter()
+        if run is not None and run.manual:
+            if inside:
+                auto = isinstance(task, self._auto_combat)
+                self.end_run('自动战斗接管了这一局' if auto else f'{type(task).__name__} 开始打了')
+                if auto and self.owner is not None:
+                    self.manual.warn(self.owner)
+            return
         if inside:
             if run is None and self.should_record(task):
                 self.start_run(task)
             elif run is not None and run.task is task and not self.should_record(task):
-                self.end_run('记录已关闭')
+                self.end_run('记录已关闭' if getattr(task, 'enabled', True) else TASK_DISABLED_REASON)
         elif run is not None and run.task is task:
             self.end_run(getattr(task, 'out_of_combat_reason', '') or 'in_combat False')
 
@@ -550,14 +597,7 @@ class Recorder:
             self.ensure_interaction_patched(task.executor.interaction)
         except Exception:
             pass
-        self.queue.put((_START, run, self._header(task, run)))
-        self.idle_sink = None
-        try:
-            self.sink = self._new_sink(run)
-        except Exception as e:
-            self.sink = None
-            self._log_error('跑轴记录: 这局不存画面', e)
-        self.run = run
+        self._begin(run, self._header(task, run))
         try:
             cached = task.scene._in_team
             if cached is not None:
@@ -565,12 +605,48 @@ class Recorder:
         except Exception:
             pass
 
+    def start_manual_run(self, team_task, by, t0, rec=None):
+        """人为操作的一局。team_task 是自动战斗任务(关着的), 只借它认到的队伍和键位写表头; rec 是这局的录屏计划。"""
+        owner = self.owner
+        config = owner.config if owner is not None else {}
+        run = Run(None, reads=False, logs=bool(config.get(getattr(owner, 'LOGS_KEY', ''), True)),
+                  t0=t0, manual=True, by=by)
+        header = self._header(team_task, run)
+        header.update(task=MANUAL_TASK_NAME, mode='manual', by=by)
+        note = str(config.get(getattr(owner, 'MANUAL_NOTE_KEY', ''), '') or '').strip()
+        if note:
+            header['note'] = note  # 和 WWKeyRecorder 的备注同一个字段
+        if rec:
+            header['rec'] = rec
+        self._begin(run, header)
+        return run
+
+    def _begin(self, run, header):
+        self._ensure_writer()
+        self.queue.put((_START, run, header))
+        self.idle_sink = None
+        try:
+            self.sink = self._new_sink(run)
+        except Exception as e:
+            self.sink = None
+            self._log_error('跑轴记录: 这局不存画面', e)
+        self.run = run
+
     def end_run(self, reason):
-        run = self.run
-        if run is None:
-            return
-        self.run = None
-        self.queue.put((_END, run, time.perf_counter(), str(reason), run.field_seen))
+        # 执行器线程、手打的采集线程、写盘线程的看门狗都可能来收尾, 只让一个收
+        with self._end_lock:
+            run = self.run
+            if run is None:
+                return
+            self.run = None
+        t = time.perf_counter()
+        stats = None
+        if run.manual:
+            try:
+                stats = self.manual.end(run, t)
+            except Exception as e:
+                self._log_error('跑轴记录: 手打收尾出错', e)
+        self.queue.put((_END, run, t, str(reason), run.field_seen, stats))
         sink = self.sink
         if sink is not None:
             self.sink = None
@@ -663,7 +739,8 @@ class Recorder:
             size = [int(task.width), int(task.height)]
         except Exception:
             pass
-        return {'e': 'start', 'v': FORMAT_VERSION, 'wall': run.wall0, 'task': type(task).__name__,
+        return {'e': 'start', 'v': FORMAT_VERSION, 'wall': run.wall0, 'local': _local_time(run.wall0),
+                'task': type(task).__name__,
                 'team': chars, 'keys': keys, 'size': size, 'plugin': self.plugin_version,
                 'reads': run.reads, 'logs': run.logs}
 
@@ -674,6 +751,13 @@ class Recorder:
 
     def put_send_input(self, run, t, copied, frame):
         self.queue.put((_SENDINPUT, run, t, copied, self.origin(frame, False), self._thread_tag(run)))
+
+    def put_raw_input(self, run, t, action, key, injected, lag, value, cut):
+        """人为操作模式: 采集线程收到的一下键盘鼠标。"""
+        self.queue.put((_RAW, run, t, action, key, injected, lag, value, cut))
+
+    def put_mark(self, run, t, name, value):
+        self.queue.put((_MARK, run, t, name, value, None, None))
 
     def _note_field(self, run, result):
         # 状态没变只记「最后一次看到」的时刻: 两次变化之间轴可能很久没看 HUD, 页面上要分得出来
@@ -737,6 +821,8 @@ class Recorder:
                     where = recorder.origin(sys._getframe(1), True)
                     if where is not None:
                         info = extract(args, kwargs, result)
+                        if info[3] is not None:
+                            info = info[:3] + (_plain(info[3]),) + info[4:]
                         if info[1] is None and (kind == 'find' or kind == 'feat'):
                             box = _feature_search_box(task, info[0], args, kwargs)
                             if box is not None:
@@ -892,10 +978,10 @@ class Recorder:
             now = time.monotonic()
             if now - last_scan >= 0.5:
                 last_scan = now
-                if self.idle_sink is not None and now >= self.idle_sink_until:
-                    self.idle_sink = None  # 放掉最近几秒原图占的内存
-                for run_file in tuple(files.values()):
-                    self._flush_idle(run_file, now)
+                try:
+                    self._periodic(files, now)
+                except Exception as e:
+                    self._log_error('跑轴记录: 写盘出错', e)
         while True:
             try:
                 item = self.queue.get_nowait()
@@ -905,6 +991,45 @@ class Recorder:
                 self._handle_safely(files, item)
         for run, run_file in tuple(files.items()):
             self._close(files, run, {'e': 'end', 't': _rel(run, time.perf_counter()), 'reason': '记录线程退出'})
+
+    def _periodic(self, files, now):
+        if self.idle_sink is not None and now >= self.idle_sink_until:
+            self.idle_sink = None  # 放掉最近几秒原图占的内存
+        for run_file in tuple(files.values()):
+            self._flush_idle(run_file, now)
+        self._end_stopped_run()
+
+    def _end_stopped_run(self):
+        """没人收尾的局在这里收掉, 不然一直开着、画面一直往里存, 人为操作模式也开不了局。
+
+        - 任务被关掉了: 正常关是框架在 sleep/next_frame 里抛 TaskDisabledException、自动战斗接住走 reset_to_false。
+          可队伍代码里 try: next_frame() except Exception 会把它吞掉, 框架抛之前已经清了 current_task, 之后不再抛,
+          轴照跑、任务一直算在跑; 出错被执行器直接 disable() 也不走 reset_to_false。关掉 TASK_DISABLED_END 秒还开着就收。
+        - 点了 ok-ww 的停止: 执行器暂停, 轴停在 sleep 里等, 任务开着、也算在跑。停了 TASK_PAUSED_END 秒就收,
+          接着开始的话下次判战斗另开一局。
+        - 任务没关但不在跑了、TASK_STOPPED_END 秒没判过战斗。
+        """
+        run = self.run
+        if run is None or run.manual or run.task is None:
+            return
+        task = run.task
+        now = time.perf_counter()
+        if not getattr(task, 'enabled', True):
+            if run.disabled_at is None:
+                run.disabled_at = now
+            elif now - run.disabled_at >= TASK_DISABLED_END:
+                self.end_run(TASK_DISABLED_REASON)
+            return
+        run.disabled_at = None
+        if _executor_paused(task):
+            if run.paused_at is None:
+                run.paused_at = now
+            elif now - run.paused_at >= TASK_PAUSED_END:
+                self.end_run(TASK_PAUSED_REASON)
+            return
+        run.paused_at = None
+        if not getattr(task, 'running', True) and now - run.checked_at >= TASK_STOPPED_END:
+            self.end_run('战斗任务不跑了(没走脱战判断)')
 
     def _handle_safely(self, files, item):
         try:
@@ -924,6 +1049,8 @@ class Recorder:
             end = {'e': 'end', 't': _rel(run, item[2]), 'reason': item[3]}
             if item[4] is not None:
                 end['field_seen'] = _rel(run, item[4])
+            if item[5]:
+                end.update(item[5])
             self._close(files, run, end)
         elif code == _INPUT:
             _, _, t, action, key, down_time, where, thread = item
@@ -942,6 +1069,18 @@ class Recorder:
                 if thread:
                     event['th'] = thread
                 self._write(run_file, event)
+        elif code == _RAW:
+            _, _, t, action, key, injected, lag, value, cut = item
+            event = {'e': 'in', 't': _rel(run, t), 'a': action, 'k': key}
+            if value is not None:
+                event['v'] = value
+            if injected:
+                event['si'] = 1  # 软件模拟的输入(连点器/宏软件), 不是键盘鼠标本身发的
+            if lag:
+                event['lag'] = lag
+            if cut:
+                event['cut'] = 1  # 收尾或切出游戏时还按着, 这一刻记成松开
+            self._write(run_file, event)
         elif code == _FIELD:
             _, _, t, (in_team, index, count), previous_seen = item
             event = {'e': 'field', 't': _rel(run, t), 'team': in_team, 'i': index, 'cnt': count}
@@ -981,6 +1120,8 @@ class Recorder:
                 char['custom'] = 'custom_teams' in Path(path).parts if path else False
         names = [c['n'] for c in header.get('team') or () if c]
         label = re.sub(r'[^\w.-]+', '_', '__'.join(names)) or 'unknown'
+        if run.manual:
+            label = '手打_' + label  # 和 WWKeyRecorder 的文件名一致
         stamp = time.strftime('%Y%m%d_%H%M%S', time.localtime(run.wall0))
         path = os.path.join(self.out_dir, f'{stamp}_{label}.jsonl')
         suffix = 1
@@ -998,14 +1139,16 @@ class Recorder:
         run_file = files.pop(run, None)
         if run_file is None:
             return
-        for key in tuple(run_file.groups):
-            self._flush_group(run_file, key)
-        self._write(run_file, end_event)
         try:
-            run_file.handle.close()
-        except OSError:
-            pass
-        self._prune()
+            for key in tuple(run_file.groups):
+                self._flush_group(run_file, key)
+            self._write(run_file, end_event)
+        finally:
+            try:
+                run_file.handle.close()
+            except OSError:
+                pass
+            self._prune()
 
     def _prune(self):
         owner = self.owner
@@ -1017,10 +1160,11 @@ class Recorder:
                 pass
         paths = list_run_files(self.out_dir)
         for path in paths[:max(0, len(paths) - keep)]:
-            try:
-                os.remove(path)
-            except OSError:
-                pass
+            for doomed in (path, video_info_path(path)):
+                try:
+                    os.remove(doomed)
+                except OSError:
+                    pass
         try:
             frame_runs = max(1, int(self._option('FRAMES_KEEP_KEY', DEFAULT_FRAME_RUNS)))
         except (TypeError, ValueError):
@@ -1028,7 +1172,8 @@ class Recorder:
         prune_media(self.out_dir, list_run_files(self.out_dir), frame_runs)
 
     def _write(self, run_file, event):
-        run_file.handle.write(json.dumps(event, ensure_ascii=False, separators=(',', ':')) + '\n')
+        run_file.handle.write(json.dumps(event, ensure_ascii=False, separators=(',', ':'), default=_json_default)
+                              + '\n')
         run_file.dirty = True
 
     def _flush_idle(self, run_file, now):
@@ -1105,6 +1250,14 @@ class Recorder:
         if base is None:
             base = self._labels[filename] = os.path.basename(filename)
         return f'{base}:{line} {code.co_name}'
+
+
+def _executor_paused(task):
+    """同 TaskExecutor.blocked_by_pause: 调试模式下暂停不拦执行器; 一次性任务还能单独暂停自己。"""
+    executor = getattr(task, 'executor', None)
+    if getattr(executor, 'paused', False) is True and not getattr(executor, 'debug_mode', False):
+        return True
+    return getattr(task, 'paused', False) is True
 
 
 def _same_group(kind, group, t, value, found):
@@ -1187,6 +1340,12 @@ def _rel(run, t):
     return round(t - run.t0, 4)
 
 
+def _local_time(wall):
+    """开局的本地时间到毫秒, 和 WWKeyRecorder 表头的 local 同一个格式。"""
+    seconds, ms = divmod(int(round(wall * 1000)), 1000)
+    return time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(seconds)) + f'.{ms:03d}'
+
+
 def _round(value):
     try:
         return round(float(value), 4)
@@ -1204,7 +1363,32 @@ def _box_json(box):
     return box if isinstance(box, str) else list(box)
 
 
+def _plain(value):
+    """numpy 标量 -> Python 数。find_feature 给的置信度是 numpy.float32: 不转的话 JSON 写不出, 合并读数也不当它是数。"""
+    if value is None or type(value) in (float, int, bool, str):
+        return value
+    item = getattr(value, 'item', None)
+    if item is not None and getattr(value, 'ndim', None) == 0:
+        try:
+            return item()
+        except Exception:
+            pass
+    return value
+
+
+def _json_default(value):
+    """JSON 不认的值(numpy 数、数组……)转成认得的, 实在不行写成字符串: 一条写不出不能拖垮写盘线程。"""
+    tolist = getattr(value, 'tolist', None)
+    if tolist is not None:
+        try:
+            return tolist()
+        except Exception:
+            pass
+    return str(value)
+
+
 def _jsonable(value):
+    value = _plain(value)
     if value is None or isinstance(value, (bool, int, str)):
         return value
     if isinstance(value, float):
