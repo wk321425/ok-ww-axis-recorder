@@ -643,7 +643,7 @@ class Recorder:
         stats = None
         if run.manual:
             try:
-                stats = self.manual.end(run, t)
+                stats = self.manual.end(run, t, reason)
             except Exception as e:
                 self._log_error('跑轴记录: 手打收尾出错', e)
         self.queue.put((_END, run, t, str(reason), run.field_seen, stats))

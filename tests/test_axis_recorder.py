@@ -1,4 +1,5 @@
 """在 ok-ww 源码目录下运行: python <本文件> <ok-ww 源码目录> <.okscript 路径>"""
+import contextlib
 import ctypes
 import json
 import logging
@@ -654,14 +655,19 @@ class TestManual(PluginCase):
     def setUp(self):
         super().setUp()
         self.plugin.config[TASK_CLASS.MODE_KEY] = task_module.MODE_MANUAL
+        self.plugin.config[TASK_CLASS.MANUAL_AUTO_KEY] = True  # 下面大多是测自动认; 只认热键的另测
         self.plugin.notification = Mock()
         self.plugin.info_set = Mock()
+        tones = patch.object(sys.modules[package + '.manual'], 'play_tones')
+        self.tones = tones.start()
+        self.addCleanup(tones.stop)
         self.executor.trigger_tasks = [self.task]
         self.executor._last_frame_time = time.time() + 1e6
         self.task._enabled = False
         self.task.load_chars = Mock()
         self.driver = self.recorder.manual
         self.driver._ensure_capture = lambda: None
+        self.driver._ensure_hotkey = lambda owner: None  # 不真注册 F7(ok-ww 开着时会注册不上)
         self.enemy = False
         self.driver._enemy_visible = lambda combat: self.enemy
         self.log = self.driver.log
@@ -693,6 +699,7 @@ class TestManual(PluginCase):
         self.tick()
         self.enemy = False
         self.driver.last_enemy = time.perf_counter() - 10
+        self.log.last_action = time.perf_counter() - 10  # 上面那几下出招也过去 10 秒了
         self.tick()
         self.assertIsNone(self.recorder.run)
         self.assertTrue(wait_for(lambda: run.path and any(e['e'] == 'end' for e in read_events(run.path))))
@@ -703,7 +710,7 @@ class TestManual(PluginCase):
         self.assertEqual([c['n'] for c in header['team']], ['Alpha', 'Beta', 'Gamma'])
         self.assertFalse(header['reads'])
         self.assertIn('手打_', os.path.basename(run.path))
-        self.assertEqual(end['reason'], '5 秒没看到怪')
+        self.assertEqual(end['reason'], '5 秒没看到怪也没出招')
         self.assertEqual((end['inputs'], end['pauses'], end['paused']), (3, 0, 0.0))
         self.assertRegex(header['local'], r'^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{3}$')
         self.assertNotIn('note', header)
@@ -762,6 +769,80 @@ class TestManual(PluginCase):
         self.tick()
         self.assertIsNotNone(self.recorder.run)
 
+    def test_default_hotkey_only_never_ends_by_itself(self):
+        manual = sys.modules[package + '.manual']
+        self.plugin.config[TASK_CLASS.MANUAL_AUTO_KEY] = False
+        self.enemy = True
+        self.tick()
+        self.assertIsNone(self.recorder.run)  # 只认热键: 看到怪也不开
+        self.plugin.info_set.assert_called_with('人为操作', '等按 F7 开始')
+        self.driver.toggle_requested.set()
+        self.tick()
+        run = self.recorder.run
+        self.assertEqual(run.by, '热键')
+        self.assertEqual(self.plugin.notification.call_args[0][0], '跑轴记录: 开始记手打, 再按一下 F7 结束')
+        self.tones.assert_called_once_with(manual.TONES_START)
+        # 没怪、没出招、HUD 不在、超过 30 分钟、执行器停了, 都不收
+        self.enemy = False
+        now = time.perf_counter()
+        self.driver.last_enemy = now - 600
+        self.log.last_action = now - 600
+        self.task.find_feature = Mock(return_value=[])
+        self.driver.last_hud = now - 600
+        run.t0 = now - 31 * 60
+        self.tick()
+        self.assertIs(self.recorder.run, run)
+        self.driver.last_tick = time.perf_counter() - 10
+        self.assertTrue(self.driver._on_capture_idle(time.perf_counter()))
+        self.assertIs(self.recorder.run, run)
+        # 执行器停着时按热键, 在热键线程里收
+        self.driver._on_hotkey(self.plugin)
+        self.assertIsNone(self.recorder.run)
+        self.assertFalse(self.driver.toggle_requested.is_set())
+        self.assertEqual(self.end_and_read(run)[-1]['reason'], '按热键停止')
+        self.assertRegex(self.plugin.notification.call_args[0][0], r'^跑轴记录: 手打这局记完了\(按热键停止\), 记了 31 分 \d+ 秒$')
+        self.tones.assert_called_with(manual.TONES_END)
+
+    def test_hotkey_while_ok_ww_stopped_does_not_start_later(self):
+        self.plugin.config[TASK_CLASS.MANUAL_AUTO_KEY] = False
+        self.driver.last_tick = time.perf_counter() - 10
+        self.driver._on_hotkey(self.plugin)
+        self.assertIn('ok-ww 没在运行', self.plugin.notification.call_args[0][0])
+        self.tick()  # 执行器回来了, 刚才那下不算
+        self.assertIsNone(self.recorder.run)
+        self.driver._on_hotkey(self.plugin)  # 在跑时交给 tick
+        self.assertTrue(self.driver.toggle_requested.is_set())
+        self.tick()
+        self.assertEqual(self.recorder.run.by, '热键')
+
+    def test_hotkey_run_forgotten_ends_after_two_hours(self):
+        self.plugin.config[TASK_CLASS.MANUAL_AUTO_KEY] = False
+        self.plugin.config[TASK_CLASS.MANUAL_SOUND_KEY] = False
+        self.driver.toggle_requested.set()
+        self.tick()
+        run = self.recorder.run
+        self.tones.assert_not_called()
+        run.t0 = time.perf_counter() - 2 * 3600 - 1
+        self.tick()
+        self.assertIsNone(self.recorder.run)
+        self.assertEqual(self.end_and_read(run)[-1]['reason'], '超过 2 小时没按热键结束')
+
+    def test_no_hotkey_falls_back_to_auto(self):
+        self.plugin.config[TASK_CLASS.MANUAL_AUTO_KEY] = False
+        self.plugin.config[TASK_CLASS.MANUAL_HOTKEY_KEY] = media.NO_HOTKEY
+        self.enemy = True
+        self.tick()
+        self.assertEqual(self.recorder.run.by, '看到怪')
+        self.assertEqual(self.plugin.notification.call_args[0][0], '跑轴记录: 看到怪了, 开始记手打')
+        self.recorder.end_run('test end')
+        self.plugin.config[TASK_CLASS.MANUAL_HOTKEY_KEY] = 'F7'
+        self.driver.hotkey = SimpleNamespace(current='F7', bound=False)  # 注册不上
+        self.driver.suppress = False
+        self.tick()
+        self.assertEqual(self.recorder.run.by, '看到怪')
+        self.assertIn('(按 F7 结束)', self.plugin.notification.call_args_list[-1][0][0])
+        self.driver.hotkey = None
+
     def test_hud_gone_ends_auto_run(self):
         self.enemy = True
         self.tick()
@@ -771,7 +852,29 @@ class TestManual(PluginCase):
         self.tick()
         self.assertIsNone(self.recorder.run)
         self.assertTrue(wait_for(lambda: run.path and any(e['e'] == 'end' for e in read_events(run.path))))
-        self.assertEqual(read_events(run.path)[-1]['reason'], 'HUD 15 秒没出现')
+        self.assertEqual(read_events(run.path)[-1]['reason'], 'HUD 15 秒没出现(打完了、结算或过场)')
+
+    def test_combat_keys_keep_auto_run_open(self):
+        self.enemy = True
+        self.tick()
+        run = self.recorder.run
+        self.enemy = False
+        t = time.perf_counter()
+        self.log.set_in_game(t, True)
+        self.driver.last_enemy = t - 10
+        self.log.key(t, 'mouse', True, 'left')  # 还在打: Boss 战认不出怪也不收
+        self.tick()
+        self.assertIs(self.recorder.run, run)
+        self.log.last_action = t - 10
+        self.log.key(t, 'key', True, 'w')  # 走路、热键不算出招
+        self.log.key(t, 'key', True, 'f8')
+        self.tick()
+        self.assertIsNone(self.recorder.run)
+        self.assertEqual(self.end_and_read(run)[-1]['reason'], '5 秒没看到怪也没出招')
+        rawinput = sys.modules[package + '.rawinput']
+        self.assertTrue(rawinput.is_action('key', 'f'))  # F 处决/拾取算
+        self.assertTrue(rawinput.is_action('mouse', 'right'))
+        self.assertFalse(rawinput.is_action('key', 'lshift'))
 
     def test_auto_combat_enabled_warns_and_records_nothing(self):
         self.task._enabled = True
@@ -796,7 +899,10 @@ class TestManual(PluginCase):
         self.assertIsNone(self.recorder.run)
         self.assertTrue(wait_for(lambda: run.path and any(e['e'] == 'end' for e in read_events(run.path))))
         self.assertEqual(read_events(run.path)[-1]['reason'], '自动战斗接管了这一局')
-        self.plugin.notification.assert_called_once()
+        texts = [c[0][0] for c in self.plugin.notification.call_args_list]
+        self.assertEqual(len(texts), 3)  # 开局、收尾、提醒关自动战斗
+        self.assertIn('记完了(自动战斗接管了这一局)', texts[1])
+        self.assertIn('关掉「自动战斗」', texts[2])
 
     def test_switch_back_to_code_mode(self):
         self.enemy = True
@@ -880,11 +986,15 @@ class TestManual(PluginCase):
         has_name, _ = self.task.get_target_names()
         self.task.get_box_by_name = Mock()
         self.task.has_health_bar = Mock(return_value=False)
+        self.task.is_boss = Mock(return_value=False)
         self.task.find_best_match_in_box = Mock(return_value=Box(0, 0, 5, 5, 0.9, has_name))
         self.assertTrue(check(self.task))
         self.task.find_best_match_in_box = Mock(return_value=None)
         self.assertFalse(check(self.task))
         self.task.has_health_bar = Mock(return_value=True)
+        self.assertTrue(check(self.task))
+        self.task.has_health_bar = Mock(return_value=False)
+        self.task.is_boss = Mock(return_value=True)  # Boss 破盾/锁定标记
         self.assertTrue(check(self.task))
         self.task.send_key = Mock()
         self.task.middle_click = Mock()
@@ -897,7 +1007,11 @@ class TestManual(PluginCase):
         self.plugin.config[TASK_CLASS.MANUAL_HOTKEY_KEY] = 'F8'
         self.assertEqual(self.driver._hotkey_name(self.plugin), media.NO_HOTKEY)
 
-    def _rec_patches(self, sent, estimates, video='clip.mp4', offset=12.5):
+    @contextlib.contextmanager
+    def _rec_patches(self, sent, estimates, video='clip.mp4', offset=12.5, flips=(), foreground=lambda: True,
+                     growing=lambda: None):
+        """flips: 每次按完开关键 watch_toggle 依次给的结果(用完都是 None); foreground: 鸣潮在不在前台;
+        growing: 录屏软件正在录的那段(没在录 None)。"""
         def fake_align(path, run_path, estimate, stop=None, busy=None):
             estimates.append(estimate(100.0))
             return {'duration': 100.0, 'fps': 60.0, 'offset': offset, 'method': '画面对时', 'score': 0.05}
@@ -906,10 +1020,23 @@ class TestManual(PluginCase):
             sent.append(keys)
             return time.perf_counter()
 
-        return (patch.object(screenrec, 'send_combo', side_effect=fake_send),
-                patch.object(screenrec, 'find_video', return_value=video),
-                patch.object(screenrec, 'align', side_effect=fake_align),
-                patch.object(screenrec, 'MEDIA_SETTLE', 0))
+        flips = list(flips)
+        with patch.object(screenrec, 'send_combo', side_effect=fake_send), \
+                patch.object(screenrec, 'find_video', return_value=video), \
+                patch.object(screenrec, 'align', side_effect=fake_align), \
+                patch.object(screenrec, 'MEDIA_SETTLE', 0), \
+                patch.object(screenrec, 'FOREGROUND_POLL', 0.02), \
+                patch.object(screenrec, 'game_foreground', side_effect=lambda: foreground()), \
+                patch.object(screenrec, 'STOP_GRACE_SECONDS', 0), \
+                patch.object(screenrec, 'STOP_SETTLE_SECONDS', 0), \
+                patch.object(screenrec, 'growing_video', side_effect=lambda folder: growing()), \
+                patch.object(screenrec, 'wait_video_finished', return_value=True), \
+                patch.object(screenrec, 'watch_toggle', side_effect=lambda *a: flips.pop(0) if flips else None):
+            yield
+
+    def _toggle_config(self, folder):
+        self.plugin.config.update({TASK_CLASS.REC_TOOL_KEY: 'N卡 (NVIDIA App)', TASK_CLASS.REC_MODE_KEY: '开局开录、结束停',
+                                   TASK_CLASS.REC_KEYS_KEY: 'Alt+F9', TASK_CLASS.REC_FOLDER_KEY: folder})
 
     def test_screen_record_replay_saved_at_end_and_aligned(self):
         folder = tempfile.mkdtemp(prefix='axis_rec_video_')
@@ -918,8 +1045,7 @@ class TestManual(PluginCase):
         self.plugin.config[TASK_CLASS.REC_FOLDER_KEY] = folder
         sent, estimates = [], []
         video = os.path.join(folder, 'clip.mp4')
-        a, b, c, d = self._rec_patches(sent, estimates, video)
-        with a, b, c, d:
+        with self._rec_patches(sent, estimates, video):
             self.enemy = True
             self.tick()
             run = self.recorder.run
@@ -946,11 +1072,9 @@ class TestManual(PluginCase):
     def test_screen_record_toggle_starts_with_run(self):
         folder = tempfile.mkdtemp(prefix='axis_rec_video_')
         self.addCleanup(shutil.rmtree, folder, True)
-        self.plugin.config.update({TASK_CLASS.REC_TOOL_KEY: 'N卡 (NVIDIA App)', TASK_CLASS.REC_MODE_KEY: '开局开录、结束停',
-                                   TASK_CLASS.REC_KEYS_KEY: 'Alt+F9', TASK_CLASS.REC_FOLDER_KEY: folder})
+        self._toggle_config(folder)
         sent, estimates = [], []
-        a, b, c, d = self._rec_patches(sent, estimates, os.path.join(folder, 'clip.mp4'))
-        with a, b, c, d:
+        with self._rec_patches(sent, estimates, os.path.join(folder, 'clip.mp4')):
             self.enemy = True
             self.tick()
             run = self.recorder.run
@@ -971,11 +1095,10 @@ class TestManual(PluginCase):
     def test_screen_record_stops_even_if_key_stats_fail(self):
         folder = tempfile.mkdtemp(prefix='axis_rec_video_')
         self.addCleanup(shutil.rmtree, folder, True)
-        self.plugin.config.update({TASK_CLASS.REC_TOOL_KEY: 'N卡 (NVIDIA App)', TASK_CLASS.REC_MODE_KEY: '开局开录、结束停',
-                                   TASK_CLASS.REC_KEYS_KEY: 'Alt+F9', TASK_CLASS.REC_FOLDER_KEY: folder})
+        self._toggle_config(folder)
         sent, estimates = [], []
-        a, b, c, d = self._rec_patches(sent, estimates, os.path.join(folder, 'clip.mp4'), offset=np.float32(12.5))
-        with a, b, c, d, patch.object(self.log, 'end', side_effect=RuntimeError('boom')):
+        with self._rec_patches(sent, estimates, os.path.join(folder, 'clip.mp4'), offset=np.float32(12.5)), \
+                patch.object(self.log, 'end', side_effect=RuntimeError('boom')):
             self.enemy = True
             self.tick()
             run = self.recorder.run
@@ -989,6 +1112,150 @@ class TestManual(PluginCase):
         self.assertEqual(sent, ['Alt+F9', 'Alt+F9'])  # 停录还是按了, 不然下一局的「开始」反而把录制关掉
         self.assertEqual(events[-1]['rec']['action'], '停止录制')
         self.assertEqual(screenrec.load_video_info(run.path)['offset'], 12.5)
+
+    def test_screen_record_toggle_flipped_presses_again(self):
+        folder = tempfile.mkdtemp(prefix='axis_rec_video_')
+        self.addCleanup(shutil.rmtree, folder, True)
+        self._toggle_config(folder)
+        sent, estimates = [], []
+        # 开录那下停掉了一段之前就在录的 -> 补按开始; 停录那下又新开了一段 -> 补按停掉, 这局不找录屏
+        with self._rec_patches(sent, estimates, os.path.join(folder, 'clip.mp4'), flips=['stopped', 'started']):
+            self.enemy = True
+            self.tick()
+            run = self.recorder.run
+            self.driver.screen.current['starter'].join(5)
+            self.assertEqual(sent, ['Alt+F9', 'Alt+F9'])
+            self.driver.toggle_requested.set()
+            self.tick()
+            events = self.end_and_read(run)
+            self.assertTrue(wait_for(lambda: screenrec.load_video_info(run.path) is not None))
+        self.assertEqual(sent, ['Alt+F9'] * 4)
+        marks = [e['v'] for e in events if e['e'] == 'mark']
+        self.assertEqual(marks[0], '开始录制 Alt+F9')
+        self.assertTrue(marks[1].startswith('补按开始录制 Alt+F9'))
+        info = screenrec.load_video_info(run.path)
+        self.assertEqual(info['method'], '录屏开关对不上')
+        self.assertNotIn('path', info)
+        self.assertEqual(estimates, [])
+
+    def test_screen_record_toggle_waits_for_game_foreground(self):
+        folder = tempfile.mkdtemp(prefix='axis_rec_video_')
+        self.addCleanup(shutil.rmtree, folder, True)
+        self._toggle_config(folder)
+        sent, estimates = [], []
+        game = [False]
+        with self._rec_patches(sent, estimates, os.path.join(folder, 'clip.mp4'), foreground=lambda: game[0]):
+            # 开局时人在 ok-ww 里, 打完也没回游戏: 开录不按, 停录也不按
+            self.driver.toggle_requested.set()
+            self.tick()
+            run = self.recorder.run
+            time.sleep(0.2)
+            self.assertEqual(sent, [])
+            self.driver.toggle_requested.set()
+            self.tick()
+            self.end_and_read(run)
+            self.assertTrue(wait_for(lambda: screenrec.load_video_info(run.path) is not None))
+            self.assertEqual(sent, [])
+            self.assertEqual(screenrec.load_video_info(run.path)['method'], '没开录')
+            # 在游戏里开的录, 打完人切到 ok-ww 看复盘: 停录等回到游戏才按
+            game[0] = True
+            self.driver.toggle_requested.set()
+            self.tick()
+            run = self.recorder.run
+            self.assertTrue(wait_for(lambda: sent == ['Alt+F9']))
+            game[0] = False
+            self.driver.toggle_requested.set()
+            self.tick()
+            self.end_and_read(run)
+            time.sleep(0.2)
+            self.assertEqual(sent, ['Alt+F9'])
+            game[0] = True
+            self.assertTrue(wait_for(lambda: screenrec.load_video_info(run.path) is not None))
+        self.assertEqual(sent, ['Alt+F9', 'Alt+F9'])
+        self.assertEqual(screenrec.load_video_info(run.path)['offset'], 12.5)
+
+    def test_screen_record_toggle_follows_recording_state(self):
+        folder = tempfile.mkdtemp(prefix='axis_rec_video_')
+        self.addCleanup(shutil.rmtree, folder, True)
+        self._toggle_config(folder)
+        clip = os.path.join(folder, 'clip.mp4')
+        with open(clip, 'wb') as f:
+            f.write(b'x')
+        sent, estimates = [], []
+        recording = [clip]
+        with self._rec_patches(sent, estimates, clip, growing=lambda: recording[0]):
+            # 开局时已经在录: 不按开始, 接着录; 收尾时还在录才按停止
+            self.enemy = True
+            self.tick()
+            run = self.recorder.run
+            self.driver.screen.current['starter'].join(5)
+            self.assertEqual(sent, [])
+            self.driver.toggle_requested.set()
+            self.tick()
+            events = self.end_and_read(run)
+            self.assertTrue(wait_for(lambda: screenrec.load_video_info(run.path) is not None))
+        self.assertEqual(sent, ['Alt+F9'])
+        self.assertTrue([e['v'] for e in events if e['e'] == 'mark'][0].startswith('已经在录(clip.mp4)'))
+        info = screenrec.load_video_info(run.path)
+        self.assertEqual(info['flow'], screenrec.ADOPTED)
+        self.assertAlmostEqual(estimates[0], screenrec.wall_time(run.t0) - screenrec.video_birth(clip), places=2)
+        self.assertIn(screenrec.ADOPTED, runs.video_line(runs.RunData(run.path)))
+
+        # 按开始后认出了新的一段, 收尾时它已经停了(被手动停了): 不按停止, 找开录之后录完的那段
+        sent.clear()
+        estimates.clear()
+        recording[0] = None
+        with self._rec_patches(sent, estimates, clip, flips=['started'], growing=lambda: recording[0]):
+            self.enemy = False
+            self.driver.toggle_requested.set()
+            self.tick()
+            run = self.recorder.run
+            self.driver.screen.current['starter'].join(5)
+            self.driver.toggle_requested.set()
+            self.tick()
+            self.end_and_read(run)
+            self.assertTrue(wait_for(lambda: screenrec.load_video_info(run.path) is not None))
+        self.assertEqual(sent, ['Alt+F9'])
+        info = screenrec.load_video_info(run.path)
+        self.assertEqual((info['flow'], info['offset']), (screenrec.ALREADY_STOPPED, 12.5))
+        self.assertAlmostEqual(estimates[0], -info['started'], places=3)
+
+    def test_screen_record_toggle_hands_over_to_next_run(self):
+        folder = tempfile.mkdtemp(prefix='axis_rec_video_')
+        self.addCleanup(shutil.rmtree, folder, True)
+        self._toggle_config(folder)
+        clip = os.path.join(folder, 'clip.mp4')
+        sent, estimates = [], []
+        game, recording = [True], [None]
+        with self._rec_patches(sent, estimates, clip, foreground=lambda: game[0], growing=lambda: recording[0]):
+            self.driver.toggle_requested.set()
+            self.tick()
+            first = self.recorder.run
+            self.driver.screen.current['starter'].join(5)
+            self.assertEqual(sent, ['Alt+F9'])
+            recording[0] = clip
+            game[0] = False  # 打完人去 ok-ww 看复盘, 停录在等
+            self.driver.toggle_requested.set()
+            self.tick()
+            self.end_and_read(first)
+            time.sleep(0.2)
+            self.assertEqual(sent, ['Alt+F9'])
+            # 还没停录就开了下一局: 上一局不停了, 这局接着录同一段, 打完才停
+            self.driver.toggle_requested.set()
+            self.tick()
+            second = self.recorder.run
+            game[0] = True
+            self.driver.screen.current['starter'].join(5)
+            self.assertTrue(wait_for(lambda: screenrec.load_video_info(first.path) is not None))
+            self.assertEqual(sent, ['Alt+F9'])
+            self.driver.toggle_requested.set()
+            self.tick()
+            self.end_and_read(second)
+            self.assertTrue(wait_for(lambda: screenrec.load_video_info(second.path) is not None))
+        self.assertEqual(sent, ['Alt+F9', 'Alt+F9'])
+        info = screenrec.load_video_info(first.path)
+        self.assertEqual((info['flow'], info['path'], info['offset']), (screenrec.HANDED_OVER, clip, 12.5))
+        self.assertEqual(screenrec.load_video_info(second.path)['flow'], screenrec.ADOPTED)
 
     def test_screen_record_bad_keys_records_without_video(self):
         self.plugin.config.update({TASK_CLASS.REC_TOOL_KEY: 'A卡 (AMD Adrenalin)', TASK_CLASS.REC_KEYS_KEY: 'ctrl+banana'})
@@ -1168,6 +1435,46 @@ class TestScreenRec(unittest.TestCase):
         self.assertEqual(screenrec.find_video(self.dir, time.time() - 1, timeout=2, poll=0.05), new)
         self.assertIsNone(screenrec.find_video(self.dir, time.time() + 60, timeout=0.2, poll=0.05))
         self.assertIsNone(screenrec.find_video(os.path.join(self.dir, 'nope'), time.time(), timeout=0.2))
+
+    def test_watch_toggle_reads_folder(self):
+        def write_for(path, seconds):
+            def work():
+                end = time.monotonic() + seconds
+                with open(path, 'ab') as f:
+                    while time.monotonic() < end:
+                        f.write(b'x' * 1000)
+                        f.flush()
+                        time.sleep(0.05)
+            thread = threading.Thread(target=work)
+            thread.start()
+            return thread
+
+        with patch.object(screenrec, 'TOGGLE_POLL', 0.1), patch.object(screenrec, 'TOGGLE_CHECK_SECONDS', 1.0), \
+                patch.object(screenrec, 'GROWING_SECONDS', 0.3):
+            self.assertIsNone(screenrec.watch_toggle(self.dir, time.perf_counter()))  # 没动静
+            self.assertIsNone(screenrec.watch_toggle(os.path.join(self.dir, 'nope'), time.perf_counter()))
+            # 按之前就在录的一段, 按完写完了 = 这下把它停了
+            old = os.path.join(self.dir, 'old.mp4')
+            with open(old, 'wb') as f:
+                f.write(b'x' * 10)
+            time.sleep(1.2)
+            with open(old, 'ab') as f:
+                f.write(b'x' * 10)
+            self.assertEqual(screenrec.watch_toggle(self.dir, time.perf_counter()), 'stopped')
+            # 按之前就在录、按完还在写 = 没停也没开
+            busy = os.path.join(self.dir, 'busy.mp4')
+            with open(busy, 'wb') as f:
+                f.write(b'x' * 10)
+            time.sleep(1.2)
+            writer = write_for(busy, 1.5)
+            self.assertIsNone(screenrec.watch_toggle(self.dir, time.perf_counter()))
+            writer.join()
+            os.remove(busy)  # 刚写完, 留着会被下一下当成「停掉了它」
+            # 按之后新冒出一段、一直在变大 = 这下开了录
+            pressed = time.perf_counter()
+            writer = write_for(os.path.join(self.dir, 'new.mp4'), 1.0)
+            self.assertEqual(screenrec.watch_toggle(self.dir, pressed), 'started')
+            writer.join()
 
     def test_align_recovers_offset_from_frames(self):
         video = os.path.join(self.dir, 'clip.avi')

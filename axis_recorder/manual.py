@@ -5,7 +5,9 @@ in_combat 里会按中键锁怪、按 F 处决、按 esc, 会和人抢操作, �
 (in_team 认 HUD、锁定框模板、敌人血条), 一个键都不发。
 
 tick() 在执行器线程里由「跑轴记录」任务每 0.25 秒调一次; 开局/收尾都在这里做。
-执行器停了(用户点了停止、插件被关)tick 就不来了, 采集线程每 50ms 看一眼, 超过 TICK_LOST 秒没来就把这局收掉。
+默认只认热键: 按一下开始、再按一下结束, 中间不自己收。设置里打开「看到怪自动开局」(或热键用不了)才按怪和 HUD 自动开局收尾。
+执行器停了(用户点了停止、插件被关)tick 就不来了, 采集线程每 50ms 看一眼: 自动开的局超过 TICK_LOST 秒没来就收掉,
+热键开的局接着记按键, 等热键线程那边按热键收。
 """
 import threading
 import time
@@ -24,12 +26,19 @@ TICK_LOST = 3.0
 # HUD 不在这么久就算打完了(大招演出、处决镜头一般 2~6 秒)
 HUD_GONE_END = 15.0
 MAX_RUN_SECONDS = 30 * 60
+# 热键开的局只认热键收; 这个只防忘了按、一直记下去把盘写满
+MAX_HOTKEY_RUN_SECONDS = 2 * 3600
 # 热键结束时怪还在, 要等这么久看不到怪才重新自动开局, 免得刚停又开
 RESUME_CLEAR_SECONDS = 1.0
 WARN_EVERY = 60.0
 
 BY_ENEMY = '看到怪'
 BY_HOTKEY = '热键'
+HOTKEY_STOP = '按热键停止'  # 和 WWKeyRecorder 同一个写法
+
+# (频率, 毫秒): 开始由低到高, 结束由高到低
+TONES_START = ((880, 90), (1320, 140))
+TONES_END = ((1320, 90), (880, 140))
 
 AUTO_COMBAT_WARNING = ('跑轴记录: 人为操作模式要先在「触发任务」里关掉「自动战斗」'
                        '(开着它一进战斗就会接管), 关掉之前手打不记')
@@ -89,27 +98,33 @@ class ManualDriver:
         run = recorder.run
         if run is not None and not run.manual:
             return
+        auto = self._auto_detect(owner)
         if run is None:
             if self.suppress and in_team and not enemy and now - self.last_enemy >= RESUME_CLEAR_SECONDS:
                 self.suppress = False
             if toggle:
                 self._start(owner, combat, BY_HOTKEY, hud)
-            elif enemy and not self.suppress:
+            elif auto and enemy and not self.suppress:
                 self._start(owner, combat, BY_ENEMY, hud)
             else:
-                self._set_state(owner, '等开打')
+                self._set_state(owner, self._waiting_state(owner, auto))
             return
+        idle = self._idle_seconds(owner)
         if toggle:
-            recorder.end_run('按热键停止')  # 和 WWKeyRecorder 同一个写法
+            recorder.end_run(HOTKEY_STOP)
             self.suppress = enemy
-        elif run.by == BY_ENEMY and in_team and now - self.last_enemy >= self._idle_seconds(owner):
-            recorder.end_run(f'{self._idle_seconds(owner):g} 秒没看到怪')
-        elif run.by == BY_ENEMY and not in_team and now - self.last_hud >= HUD_GONE_END:
-            recorder.end_run(f'HUD {HUD_GONE_END:g} 秒没出现')
+        elif run.by == BY_HOTKEY:
+            if now - run.t0 >= MAX_HOTKEY_RUN_SECONDS:
+                recorder.end_run(f'超过 {MAX_HOTKEY_RUN_SECONDS // 3600} 小时没按热键结束')
+        elif in_team and now - max(self.last_enemy, self.log.last_action) >= idle:
+            # 人还在出招就不收: Boss 战锁定框和血条常常好一阵认不出来, 只看怪会打到一半被收掉
+            recorder.end_run(f'{idle:g} 秒没看到怪也没出招')
+        elif not in_team and now - self.last_hud >= HUD_GONE_END:
+            recorder.end_run(f'HUD {HUD_GONE_END:g} 秒没出现(打完了、结算或过场)')
         elif now - run.t0 >= MAX_RUN_SECONDS:
             recorder.end_run(f'超过 {MAX_RUN_SECONDS // 60} 分钟')
         if recorder.run is None:
-            self._set_state(owner, '等开打')
+            self._set_state(owner, self._waiting_state(owner, auto))
 
     def _start(self, owner, combat, by, hud):
         recorder = self.recorder
@@ -129,11 +144,18 @@ class ManualDriver:
         self.last_enemy = time.perf_counter()
         if hud:
             recorder._note_field(run, hud)
+        key = self._hotkey_name(owner)
         self._set_state(owner, f'记录中({by}开的局)')
-        logger.info(f'跑轴记录: 手打开局({by})')
+        if by == BY_HOTKEY:
+            text = f'跑轴记录: 开始记手打, 再按一下 {key} 结束'
+        else:
+            text = '跑轴记录: 看到怪了, 开始记手打' + ('' if key == NO_HOTKEY else f'(按 {key} 结束)')
+        self._announce(owner, text, TONES_START)
 
-    def end(self, run, t):
+    def end(self, run, t, reason=''):
         """记录器收尾时调: 先把按着的键记成松开, 再按录屏的停止/存回放; 返回要写进 end 的按键次数、暂停和录屏。"""
+        self._announce(self.recorder.owner, f'跑轴记录: 手打这局记完了({reason}), 记了 {_clock(t - run.t0)}',
+                       TONES_END)
         try:
             stats = self.log.end(run, t)
         except Exception as e:
@@ -162,7 +184,8 @@ class ManualDriver:
 
     @staticmethod
     def _enemy_visible(combat):
-        """锁定框或敌人血条, 只读屏。照 CombatCheck.has_target 的前三个框, 但不走它按 esc 修熊的那支。"""
+        """锁定框、敌人血条或 Boss 破盾/锁定标记, 只读屏。照 CombatCheck.has_target 的前三个框,
+        但不走它按 esc 修熊的那支; Boss 那两个模板是 check_health_bar 里的 is_boss。"""
         has_name, no_name = combat.get_target_names()
         names = [has_name, no_name]
         scale = 1.2 if combat.is_browser() else 1.1
@@ -173,7 +196,24 @@ class ManualDriver:
                 if best.name == has_name:
                     return True
                 break
-        return bool(combat.has_health_bar())
+        if combat.has_health_bar():
+            return True
+        is_boss = getattr(combat, 'is_boss', None)
+        return bool(is_boss and is_boss())
+
+    def _auto_detect(self, owner):
+        """看到怪自动开局、没怪自动收: 设置里打开了, 或者热键用不了(选了不用、和导出撞、注册不上)时只能靠它。"""
+        try:
+            if owner.config.get(owner.MANUAL_AUTO_KEY, False):
+                return True
+        except Exception:
+            return True
+        name = self._hotkey_name(owner)
+        hotkey = self.hotkey
+        return name == NO_HOTKEY or (hotkey is not None and hotkey.current == name and not hotkey.bound)
+
+    def _waiting_state(self, owner, auto):
+        return '等开打' if auto else f'等按 {self._hotkey_name(owner)} 开始'
 
     @staticmethod
     def _idle_seconds(owner):
@@ -202,6 +242,23 @@ class ManualDriver:
         except Exception:
             pass
 
+    @staticmethod
+    def _announce(owner, text, tones):
+        """开局/收尾提示: 托盘通知 + 响两声。游戏全屏时 Windows 勿扰常把通知横幅藏起来, 所以还要响。"""
+        logger.info(text)
+        if owner is None:
+            return
+        try:
+            owner.notification(text, tray=True)
+        except Exception:
+            pass
+        try:
+            sound = owner.config.get(owner.MANUAL_SOUND_KEY, True)
+        except Exception:
+            sound = True
+        if sound:
+            play_tones(tones)
+
     # ---------- 线程 ----------
 
     def _ensure_capture(self):
@@ -221,7 +278,8 @@ class ManualDriver:
 
     def _ensure_hotkey(self, owner):
         if self.hotkey is None and self.recorder.media is not None:
-            self.hotkey = HotkeyThread(lambda: self._hotkey_name(owner), self.toggle_requested.set, label='手打开始/结束')
+            self.hotkey = HotkeyThread(lambda: self._hotkey_name(owner), lambda: self._on_hotkey(owner),
+                                       label='手打开始/结束')
             self.hotkey.start()
 
     def _hotkey_name(self, owner):
@@ -233,6 +291,23 @@ class ManualDriver:
         if wanted not in HOTKEYS or wanted == export:
             return NO_HOTKEY  # 和导出原图同一个键时只留导出
         return wanted
+
+    def _on_hotkey(self, owner):
+        """热键线程调。执行器在跑就交给 tick; 停着(点了停止、插件被关)tick 不来, 正在记的局在这里收,
+        没在记就不开(开局要读画面认队伍), 也不留着等执行器回来再开。"""
+        if time.perf_counter() - self.last_tick < TICK_LOST:
+            self.toggle_requested.set()
+            return
+        run = self.recorder.run
+        if run is not None and run.manual:
+            self.recorder.end_run(HOTKEY_STOP)
+            return
+        text = '跑轴记录: ok-ww 没在运行, 这下没开始记(先点 ok-ww 的开始再按)'
+        logger.warning(text)
+        try:
+            owner.notification(text, tray=True)
+        except Exception:
+            pass
 
     def stop(self):
         self._stop_capture()
@@ -248,6 +323,8 @@ class ManualDriver:
             return True
         run = self.recorder.run
         if run is not None and run.manual:
+            if run.by == BY_HOTKEY:
+                return True  # 热键开的局只认热键收, 接着记按键; 热键在 _on_hotkey 里收
             self.recorder.end_run('ok-ww 停下了(执行器暂停或插件被关)')
         return False
 
@@ -256,3 +333,21 @@ class ManualDriver:
 
     def _mark(self, run, t, name, value):
         self.recorder.put_mark(run, t, name, value)
+
+
+def _clock(seconds):
+    seconds = max(0, int(seconds))
+    return f'{seconds // 60} 分 {seconds % 60} 秒' if seconds >= 60 else f'{seconds} 秒'
+
+
+def play_tones(tones):
+    """另起一个线程响(Beep 会卡住调用它的线程)。走默认声卡, 显卡录屏会一起录进去。"""
+    def beep():
+        try:
+            import winsound
+            for freq, ms in tones:
+                winsound.Beep(freq, ms)
+        except Exception:
+            pass
+
+    threading.Thread(target=beep, name='axis_recorder_beep', daemon=True).start()

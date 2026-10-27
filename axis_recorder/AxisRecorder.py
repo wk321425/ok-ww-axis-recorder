@@ -7,7 +7,7 @@ from .screenrec import MODE_REPLAY, MODE_TOGGLE, REC_OFF, TOOLS
 
 logger = Logger.get_logger(__name__)
 
-PLUGIN_VERSION = '0.4.4'
+PLUGIN_VERSION = '0.4.7'
 
 MODE_CODE = '测试代码'
 MODE_MANUAL = '人为操作'
@@ -37,6 +37,8 @@ def _missing_patch_points():
 class AxisRecorderTask(TriggerTask):
     MODE_KEY = '记录模式'
     MANUAL_HOTKEY_KEY = '手打开始/结束热键'
+    MANUAL_SOUND_KEY = '手打开始/结束响一声'
+    MANUAL_AUTO_KEY = '看到怪自动开局'
     MANUAL_IDLE_KEY = '手打没怪几秒算打完'
     MANUAL_NOTE_KEY = '手打备注'
     REC_TOOL_KEY = '手打录屏'
@@ -63,6 +65,8 @@ class AxisRecorderTask(TriggerTask):
         self.default_config.update({
             self.MODE_KEY: MODE_CODE,
             self.MANUAL_HOTKEY_KEY: 'F7',
+            self.MANUAL_SOUND_KEY: True,
+            self.MANUAL_AUTO_KEY: False,
             self.MANUAL_IDLE_KEY: 5,
             self.MANUAL_NOTE_KEY: '',
             self.REC_TOOL_KEY: REC_OFF,
@@ -84,11 +88,17 @@ class AxisRecorderTask(TriggerTask):
                             f'{MODE_MANUAL}: 记自己手打的每一局(按键用 Raw Input 收, 含按住多久; 在场角色读 HUD; 画面和 F8 导出照旧)。'
                             f'选{MODE_MANUAL}前要先在「触发任务」里关掉「自动战斗」, 开着它一进战斗就会接管, 关掉之前手打不记; '
                             f'ok-ww 也要保持在运行(触发任务在跑)'),
-            self.MANUAL_HOTKEY_KEY: (f'{MODE_MANUAL}时按一下开始记、再按一下结束, 不管有没有怪。'
-                                     f'不按也会自动认: 看到锁定框或敌人血条开局, 没怪了自动结束。'
-                                     f'和导出原图热键选成同一个时只留导出'),
-            self.MANUAL_IDLE_KEY: (f'{MODE_MANUAL}自动开的局: HUD 在、但连续这么多秒没看到锁定框和血条就算打完'
-                                   f'(换波刷怪慢的本可以调大; 大招演出 HUD 不在的时候不算)'),
+            self.MANUAL_HOTKEY_KEY: (f'{MODE_MANUAL}时按一下开始记、再按一下结束; 中间不管有没有怪、HUD 在不在都不会自己停'
+                                     f'(只有切回{MODE_CODE}、打开自动战斗、关掉 ok-ww 会收掉, 忘了按的 2 小时后收)。'
+                                     f'开始和结束都会弹通知、响一声。和导出原图热键选成同一个时只留导出'),
+            self.MANUAL_SOUND_KEY: ('开始响两声由低到高, 结束由高到低。游戏全屏时 Windows 勿扰常把通知横幅藏起来, '
+                                    '听声音最准; 开着显卡录屏的话这两声也会录进去'),
+            self.MANUAL_AUTO_KEY: (f'默认关: {MODE_MANUAL}只认上面的热键开始/结束。打开后不按热键也会自己认: '
+                                   f'看到锁定框、敌人血条或 Boss 标记就开局, 没怪了、HUD 不在了自动结束(热键开的局还是只认热键)。'
+                                   f'热键选了不用、和导出撞了或注册不上时按打开算'),
+            self.MANUAL_IDLE_KEY: (f'打开「看到怪自动开局」时, 自动开的局: HUD 在、但连续这么多秒既没看到锁定框/血条、也没出招'
+                                   f'(走路跳跃冲刺不算)就算打完(换波刷怪慢的本可以调大)。'
+                                   f'HUD 不在(大招演出、结算、过场)是另一条: 连续 15 秒不在才结束, 不看这个设置'),
             self.MANUAL_NOTE_KEY: (f'{MODE_MANUAL}时写进每一局的表头(比如「4R16居」「第二版起手」), '
                                    f'复盘页摘要里显示; 不改就一直用这句, 换打法时记得改'),
             self.REC_TOOL_KEY: (f'{MODE_MANUAL}时替你按显卡录屏软件的快捷键, 打完找到录屏文件, 拿插件存的画面和录屏逐帧比出时间差, '
@@ -96,8 +106,9 @@ class AxisRecorderTask(TriggerTask):
                                 f'N 卡要在 NVIDIA App 里开着「即时重放」, A 卡在 Adrenalin 里开「即时重放」, '
                                 f'Win 游戏栏要在 设置>游戏>捕获 里开「录制所发生的事情」。录屏软件认不认模拟按键, 先实机试一局'),
             self.REC_MODE_KEY: (f'{MODE_REPLAY}: 一局打完按一下存回放, 回放时长要盖过一局(N 卡默认 5 分钟; 游戏栏默认 30 秒, 要调长)。'
-                                f'{MODE_TOGGLE}: 开局按一下开始录、结束再按一下停; 录屏软件没开着或快捷键不对时开和停会错位'
-                                f'(变成打完才开始录), 所以默认用存回放'),
+                                f'{MODE_TOGGLE}: 开局按开始录、打完按停止, 按之前先看录屏文件夹里有没有正在录的(在录就不按开始, '
+                                f'已经停了就不按停止); 只在鸣潮在前台时按; 打完等 5 秒再停, 这期间下一局开打就接着录不停。'
+                                f'录屏软件没开着或快捷键不对时还是可能错位, 所以默认用存回放'),
             self.REC_KEYS_KEY: ('留空用默认: N 卡读 NVIDIA App 里设的(出厂 存回放 Alt+F10 / 录制 Alt+F9), '
                                 'A 卡 Ctrl+Shift+S / Ctrl+Shift+E, 游戏栏 Win+Alt+G / Win+Alt+R。'
                                 '自己改过的写成 alt+f10 这样, 填上面选的录屏方式用的那个'),

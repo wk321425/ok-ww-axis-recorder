@@ -4,6 +4,8 @@
   不经过 ctypes.windll.user32 上记录器装的 SendInput 补丁, 也就不会被当成轴的按键记进去;
   Raw Input 那边会收到这几下(带软件模拟标记), 发键前后让 InputLog 静音一下。
 - N 卡的快捷键、保存文件夹、回放时长直接读 NVIDIA 写在注册表里的设置(用户改过也跟着走), 读不到用默认。
+- 开局开录是开关键, 按一下状态反一次, 插件看不到录屏软件在不在录: 只在鸣潮在前台时按, 按完看录屏文件夹
+  认出按反了补按一次, 找到的录屏比开录还早就不认。存回放没有这个问题。
 - 对时: 先按按键时刻估一个偏移(存回放=片子结尾是按键那一刻, 开录=片子开头是按键那一刻), 再在估计值前后几秒
   把插件存的低清画面和录屏帧缩成小灰度图逐帧比, 取差最小的偏移。比不上(窗口化录了整个桌面、录屏解不开)就留估计值。
 结果写在这局旁边的 <stem>.video.json: 录屏秒 = 记录秒 + offset。
@@ -16,6 +18,8 @@ import time
 from ctypes import wintypes as w
 
 from ok import Logger
+
+from .rawinput import GameWindow
 
 logger = Logger.get_logger(__name__)
 
@@ -48,6 +52,31 @@ THUMB = (96, 54)
 MATCH_MAX_SCORE = 0.4
 MATCH_MIN_CONTRAST = 0.3
 FLAT_STD = 8.0
+# 开录/停录只在鸣潮在前台时按: 录屏软件的快捷键管的是前台那个程序, ok-ww 在前台时按, N 卡开关的是「桌面」那段,
+# 和游戏那段就对不上了(10-27 反馈包: 开录那下把一段之前就在录的停了, 停录那下又新开了一段)
+FOREGROUND_POLL = 0.2
+# 打完人在 ok-ww 里看复盘, 停录等回到鸣潮再按, 最多等这么久
+STOP_WAIT_SECONDS = 600.0
+# 打完(鸣潮在前台)再等这么久才停录: 下一局/下一波接着开打就接着录, 不停(10-27 反馈: 停录拖到下一局打着时才按, 把录屏停了)
+STOP_GRACE_SECONDS = 5.0
+# 在不在录: 看录屏文件夹里有没有隔这么久还在变大的文件(N 卡开录就建文件、边录边写); 只看这么久以内建的/改过的
+GROW_CHECK_SECONDS = 1.0
+RECENT_SECONDS = 6 * 3600.0
+# 交接给下一局接着录的那段, 等它录完再对时, 最多等这么久
+FOLLOW_WAIT_SECONDS = 2 * 3600.0
+# 按完开录/停录看这么久录屏文件夹, 认出按反了就补按一次。N 卡是开录就建文件、边录边变大, 停了才写完
+TOGGLE_CHECK_SECONDS = 8.0
+TOGGLE_POLL = 1.0
+# 新冒出来的文件要一直变大这么久才算新开了一段(存回放、搬文件一会儿就写完了)
+GROWING_SECONDS = 3.0
+# 上一局停录的文件写完之前不按开录, 不然它写完会被当成「开录那下把它停了」
+STOP_SETTLE_SECONDS = 3.0
+# 开局开录时找到的录屏比按开始录制还早这么多秒开录, 就不是这局的
+NOT_OURS_SECONDS = 3.0
+# video.json 的 flow: 这局的录屏是怎么开、怎么停的(复盘页摘要里多显示一行)
+ADOPTED = '开局时已经在录, 没按开始, 接着录'
+HANDED_OVER = '还没停录下一局就开打了, 没停, 下一局接着录(两局在同一段录屏里)'
+ALREADY_STOPPED = '收尾时录屏已经停了(被手动停了?), 没按停止, 免得反而开出一段新的'
 
 user32 = ctypes.WinDLL('user32', use_last_error=True)
 
@@ -262,6 +291,15 @@ def find_video(folder, since_wall, timeout=FIND_TIMEOUT, stop=None, poll=1.0):
 
 def _newest_video(folder, after):
     best = None
+    for path, (_, mtime, size) in _video_files(folder).items():
+        if mtime >= after and (best is None or mtime > best[0]):
+            best = (mtime, path, size)
+    return None if best is None else (best[1], best[2])
+
+
+def _video_files(folder):
+    """{路径: (建文件时刻, 修改时刻, 大小)}, 往下找 FIND_DEPTH 层。"""
+    found = {}
     pending = [(folder, 0)]
     while pending:
         current, depth = pending.pop()
@@ -275,12 +313,119 @@ def _newest_video(folder, after):
                     if depth < FIND_DEPTH:
                         pending.append((entry.path, depth + 1))
                 elif entry.name.lower().endswith(VIDEO_EXTS):
-                    stat = entry.stat()
-                    if stat.st_mtime >= after and (best is None or stat.st_mtime > best[0]):
-                        best = (stat.st_mtime, entry.path, stat.st_size)
+                    found[entry.path] = _times(entry.stat())
             except OSError:
                 continue
-    return None if best is None else (best[1], best[2])
+    return found
+
+
+def _times(stat):
+    return getattr(stat, 'st_birthtime', stat.st_ctime), stat.st_mtime, stat.st_size
+
+
+def video_birth(path):
+    try:
+        return _times(os.stat(path))[0]
+    except (OSError, TypeError):
+        return None
+
+
+def wall_time(perf):
+    return time.time() - (time.perf_counter() - perf)
+
+
+def game_foreground():
+    try:
+        return GameWindow().foreground()
+    except Exception:  # noqa: BLE001 查不了就当在前台, 照旧按
+        return True
+
+
+def wait_game_foreground(keep_waiting, timeout):
+    """等鸣潮到前台; keep_waiting() 为假或超时返回 False。"""
+    deadline = time.monotonic() + timeout
+    while not game_foreground():
+        if not keep_waiting() or time.monotonic() >= deadline:
+            return False
+        time.sleep(FOREGROUND_POLL)
+    return True
+
+
+def growing_video(folder):
+    """录屏软件正在录的那段(隔 GROW_CHECK_SECONDS 还在变大的录屏文件), 没有返回 None。
+    目录里的大小可能不跟着正在写的文件走, 用 os.stat 现查。"""
+    if not folder or not os.path.isdir(folder):
+        return None
+    recent = time.time() - RECENT_SECONDS
+    sizes = {}
+    for path, (birth, mtime, _) in _video_files(folder).items():
+        if max(birth, mtime) >= recent:
+            try:
+                sizes[path] = os.stat(path).st_size
+            except OSError:
+                continue
+    if not sizes:
+        return None
+    time.sleep(GROW_CHECK_SECONDS)
+    for path, size in sizes.items():
+        try:
+            if os.stat(path).st_size > size:
+                return path
+        except OSError:
+            continue
+    return None
+
+
+def wait_video_finished(path, stop=None, timeout=FOLLOW_WAIT_SECONDS, poll=2.0):
+    """等这段录屏不再变大(录完了); 超时、被叫停或文件没了返回 False。"""
+    deadline = time.monotonic() + timeout
+    last = None
+    while time.monotonic() < deadline and not (stop and stop.is_set()):
+        try:
+            stat = os.stat(path)
+        except OSError:
+            return False
+        now = (stat.st_size, stat.st_mtime)
+        if now == last and stat.st_size > 0:
+            return True
+        last = now
+        time.sleep(poll)
+    return False
+
+
+def watch_toggle(folder, pressed, stop=None):
+    """按完开录/停录(pressed 是 perf_counter)看录屏文件夹:
+    'stopped' = 一段按之前就在录的写完了(这下把它停了); 'started' = 按之后新冒出一段、一直在变大(这下开了录);
+    看不出返回 None。目录里的大小可能不跟着正在写的文件走, 候选文件用 os.stat 现查。"""
+    if not folder or not os.path.isdir(folder):
+        return None
+    press = wall_time(pressed)
+    deadline = time.monotonic() + TOGGLE_CHECK_SECONDS
+    seen = {}
+    while not (stop and stop.is_set()):
+        now = time.monotonic()
+        for path, (birth, mtime, _) in _video_files(folder).items():
+            if max(birth, mtime) < press - 1:
+                continue
+            try:
+                birth, mtime, size = _times(os.stat(path))
+            except OSError:
+                continue
+            prev = seen.get(path)
+            if birth < press - 1:
+                if mtime >= press - 0.5 and size > 0 and prev is not None and prev[:2] == (size, mtime):
+                    return 'stopped'
+                seen[path] = (size, mtime, now)
+            elif prev is None or size <= prev[0]:
+                seen[path] = (size, mtime, now)  # 刚看到或者没变大, 从现在重新计
+            else:
+                seen[path] = (size, mtime, prev[2])
+                if now - prev[2] >= GROWING_SECONDS:
+                    return 'started'
+        if now >= deadline:
+            return None
+        time.sleep(TOGGLE_POLL)
+    return None
 
 
 # ---------- 对时 ----------
@@ -510,13 +655,16 @@ class ScreenRec:
         self.current = None
         if plan is None:
             return
-        current = {'run': run, 'plan': plan, 'start': None, 'starter': None}
+        # start: 按开始录制的时刻; adopted: 开局时已经在录的那段(没按); seen: 看得到在不在录(按完开录认出了新的一段)
+        current = {'run': run, 'plan': plan, 'start': None, 'adopted': None, 'seen': False, 'starter': None}
+        self.current = current  # 先登记: 开录线程拿「还是不是这局」决定等不等鸣潮到前台
         if plan['mode'] == 'toggle':
+            for job in self.jobs:
+                job.handover.set()  # 上一局还没停录的就不停了, 这局接着录
             starter = threading.Thread(target=self._press_start, args=(current,), name='axis_recorder_rec',
                                        daemon=True)
             current['starter'] = starter
             starter.start()
-        self.current = current
 
     def end(self, run, t):
         """收尾: 起后台线程按停止录制/存回放、找文件、对时。返回要写进 end 的 rec。"""
@@ -544,10 +692,33 @@ class ScreenRec:
             return None
 
     def _press_start(self, current):
-        pressed = self.press(current['plan']['keys'])
-        if pressed is not None:
-            current['start'] = pressed
-            self.mark(current['run'], pressed, '录屏', f"开始录制 {current['plan']['keys']}")
+        run, plan = current['run'], current['plan']
+        keys, folder = plan['keys'], plan['folder']
+        for job in list(self.jobs):
+            job.pressed.wait(30)  # 上一局停录按完或者交接给这局了
+            if job.pressed_at is not None:
+                time.sleep(max(0.0, job.pressed_at + STOP_SETTLE_SECONDS - time.perf_counter()))
+        if not wait_game_foreground(lambda: self.current is current, float('inf')):
+            return  # 打完鸣潮都没到前台, 开录没按, 收尾也就不按停
+        recording = growing_video(folder)
+        if recording is not None:
+            current['adopted'] = recording
+            current['seen'] = True
+            self.mark(run, time.perf_counter(), '录屏', f'已经在录({os.path.basename(recording)}), 不按开始')
+            return
+        pressed = self.press(keys)
+        if pressed is None:
+            return
+        current['start'] = pressed
+        self.mark(run, pressed, '录屏', f'开始录制 {keys}')
+        result = watch_toggle(folder, pressed)
+        current['seen'] = result == 'started'
+        if result == 'stopped':
+            again = self.press(keys)
+            if again is not None:
+                current['start'] = again
+                self.mark(run, again, '录屏', f'补按开始录制 {keys}(刚才那下把一段之前就在录的停了)')
+                logger.warning(f'跑轴记录: 按开始录制 {keys} 反而停掉了一段正在录的, 录屏软件的开关和插件反了, 已补按一次')
 
 
 class VideoJob(threading.Thread):
@@ -560,6 +731,11 @@ class VideoJob(threading.Thread):
         self.current = current
         self.owner = owner
         self.stop_event = threading.Event()
+        # 收尾那下快捷键按完了(或者不按了); 下一局的开录等它
+        self.pressed = threading.Event()
+        self.pressed_at = None
+        # 还没停录下一局就开打了: 不停, 交给下一局接着录
+        self.handover = threading.Event()
 
     def stop(self):
         self.stop_event.set()
@@ -570,53 +746,153 @@ class VideoJob(threading.Thread):
         try:
             starter = current.get('starter')
             if starter is not None:
-                starter.join(10)
-            pressed = self.owner.press(plan['keys'])
-            if pressed is None:
-                info.update(method='没按出快捷键', note='SendInput 发键失败, 看 ok-ww 日志')
-            else:
-                info['sent'] = round(pressed - run.t0, 4)
-                start = current.get('start')
-                if start is not None:
-                    info['started'] = round(start - run.t0, 4)
-                self._find_and_align(info, pressed, start)
+                starter.join(TOGGLE_CHECK_SECONDS + 20)
+            start = current.get('start')
+            if start is not None:
+                info['started'] = round(start - run.t0, 4)
+            try:
+                pressed = self.pressed_at = self._press_end(info)
+                if pressed is not None:
+                    info['sent'] = round(pressed - run.t0, 4)
+                    if plan['mode'] == 'toggle' and not self._check_stop(info, pressed):
+                        pressed = None
+            finally:
+                self.pressed.set()  # 下一局开录只等到这里, 找文件对时不用等
+            path = self._video_path(info, pressed)
+            if path is not None:
+                self._find_and_align(info, path, pressed)
         except Exception as e:  # noqa: BLE001 对时失败不影响记录本身
             info.update(method=info.get('method') or '对时出错', note=f'{type(e).__name__}: {e}')
+        finally:
+            self.pressed.set()
         try:
             self._write(info)
         except Exception as e:
             logger.error('跑轴记录: 写录屏对时结果出错', e)
 
-    def _find_and_align(self, info, pressed, start):
-        run, plan = self.run_ref, self.plan
-        sent_wall = time.time() - (time.perf_counter() - pressed)
-        path = find_video(plan['folder'], sent_wall, stop=self.stop_event)
+    def _press_end(self, info):
+        """按停止录制/存回放, 返回按下的时刻; 不按返回 None(原因写进 info, 要接着找录屏的写 info['flow'])。"""
+        plan, current, keys = self.plan, self.current, self.plan['keys']
+        if plan['mode'] == 'toggle':
+            if current.get('start') is None and current.get('adopted') is None:
+                info.update(method='没开录', note='这局打着的时候鸣潮一直不在前台(或者开录没按出来), 停止录制也就不按')
+                return None
+            waited = self._wait_to_stop()
+            if waited == 'handover':
+                info.update(flow=HANDED_OVER, recording=growing_video(plan['folder']))
+                return None
+            if waited != 'ok':
+                info.update(method='没按停止录制',
+                            note=f'鸣潮 {STOP_WAIT_SECONDS / 60:g} 分钟都没回到前台, 录屏软件可能还在录, 回游戏手动按一次 {keys}')
+                logger.warning(f"跑轴记录: {info['note']}")
+                return None
+            if current.get('seen') and growing_video(plan['folder']) is None:
+                info.update(flow=ALREADY_STOPPED)  # 不按: 按了反而开出一段新的
+                return None
+        pressed = self.owner.press(keys)
+        if pressed is None:
+            info.update(method='没按出快捷键', note='SendInput 发键失败, 看 ok-ww 日志')
+        return pressed
+
+    def _wait_to_stop(self):
+        """等鸣潮在前台连续 STOP_GRACE_SECONDS 秒: 'ok' 能按了, 'handover' 下一局开打了, 'timeout' / 'stopped'。"""
+        deadline = time.monotonic() + STOP_WAIT_SECONDS
+        since = None
+        while not self.stop_event.is_set():
+            if self.handover.is_set():
+                return 'handover'
+            now = time.monotonic()
+            if game_foreground():
+                since = now if since is None else since
+                if now - since >= STOP_GRACE_SECONDS:
+                    return 'ok'
+            else:
+                since = None
+                if now >= deadline:
+                    return 'timeout'
+            time.sleep(FOREGROUND_POLL)
+        return 'stopped'
+
+    def _video_path(self, info, pressed):
+        """这局的录屏文件; 找不到返回 None(原因写进 info)。"""
+        plan, current, run = self.plan, self.current, self.run_ref
+        flow = info.get('flow')
+        if pressed is not None:
+            path = find_video(plan['folder'], wall_time(pressed), stop=self.stop_event)
+        elif flow == HANDED_OVER:
+            # 下一局停录时这段才录完, 等它
+            path = info.pop('recording', None)
+            if path is not None and not wait_video_finished(path, self.stop_event):
+                info.update(method='没等到录完', note=f'{os.path.basename(path)} 一直在录, 没对时')
+                return None
+        elif flow == ALREADY_STOPPED:
+            # 被手动停了之类: 找开录之后录完的那段
+            began = current.get('start') if current.get('start') is not None else run.t0
+            path = find_video(plan['folder'], wall_time(began), timeout=10, stop=self.stop_event)
+        else:
+            return None
         if path is None:
-            info.update(method='没找到录屏', note=f"{FIND_TIMEOUT:g} 秒内 {plan['folder']} 里没有新的录屏文件"
+            info.update(method='没找到录屏', note=f"{plan['folder']} 里没有这局的录屏文件"
                                              '(快捷键没被录屏软件认到? 即时重放没开? 文件夹不对?)')
-            return
+        return path
+
+    def _check_stop(self, info, pressed):
+        """开局开录: 停录那下要是反而新开了一段(这局其实没在录), 补按一次停掉, 这局不找录屏。"""
+        keys = self.plan['keys']
+        if watch_toggle(self.plan['folder'], pressed, self.stop_event) != 'started':
+            return True
+        again = self.owner.press(keys)
+        if again is not None:
+            self.pressed_at = again
+        info.update(method='录屏开关对不上',
+                    note=f'按停止录制 {keys} 反而开始了一段录制(这局其实没在录, 开局那下没开成或被手动停了), '
+                         + ('已补按一次停掉; 这局没有录屏' if again is not None else '补按也没按出来, 录屏软件可能还在录'))
+        logger.warning(f"跑轴记录: {info['note']}")
+        return False
+
+    def _find_and_align(self, info, path, pressed):
+        run, plan, current = self.run_ref, self.plan, self.current
         info['path'] = path
-        sent_rel = pressed - run.t0
-        if plan['mode'] == 'toggle' and start is not None:
+        start = current.get('start')
+        birth = video_birth(path)
+        if plan['mode'] == 'toggle' and start is not None and birth is not None \
+                and birth < wall_time(start) - NOT_OURS_SECONDS:
+            # 按键估算拿别人的片子算出来的偏移是错的, 宁可不给
+            info.update(method='录屏对不上', note=f'找到的 {os.path.basename(path)} 在按开始录制之前 '
+                                               f'{wall_time(start) - birth:.0f} 秒就开录了, 不是这局的(录屏软件的开关和插件反了)')
+            return
+        if plan['mode'] != 'toggle':
+            sent_rel = pressed - run.t0
+
+            def estimate(duration):
+                return duration - sent_rel  # 片尾 = 按存回放那一刻
+        elif start is not None:
             start_rel = start - run.t0
 
             def estimate(duration):
                 return -start_rel  # 片头 = 按开始录制那一刻
         else:
+            info.setdefault('flow', ADOPTED)
+            t0_wall = wall_time(run.t0)
+
             def estimate(duration):
-                return duration - sent_rel  # 片尾 = 按存回放/停止录制那一刻
-        for _ in range(100):  # 写盘线程开文件比这里慢的极端情况
-            if run.path:
-                break
-            time.sleep(0.1)
-        if not run.path:
+                return t0_wall - birth if birth is not None else 0.0  # 片头 ≈ 文件建出来那一刻
+        if not self._wait_path():
             return
         time.sleep(MEDIA_SETTLE)
         info.update(align(path, run.path, estimate, self.stop_event, self.owner.busy))
 
+    def _wait_path(self):
+        run = self.run_ref
+        for _ in range(100):  # 写盘线程开文件比这里慢的极端情况(一局很短、没找录屏就直接写结果)
+            if run.path:
+                return True
+            time.sleep(0.1)
+        return bool(run.path)
+
     def _write(self, info):
         run = self.run_ref
-        if not run.path:
+        if not self._wait_path():
             return
         # 先拼好再写: 写到一半抛错会留下半个 JSON, 页面就一直显示对时中
         text = json.dumps(info, ensure_ascii=False, indent=1, default=_json_default)

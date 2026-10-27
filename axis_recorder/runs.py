@@ -604,11 +604,14 @@ def video_line(run):
             return f"录屏: {TOOL_NAMES.get(rec.get('tool'), rec.get('tool'))} 打完后在找录屏文件、对时(一两分钟)"
         return None
     if video_offset(run) is None:
-        return f"录屏: {video.get('method')}: {video.get('note', '')}"
-    line = (f"录屏: {os.path.basename(video['path'])}  ·  录屏秒 = 记录秒 {video['offset']:+.3f}"
-            f"({video.get('method')})")
-    if video.get('note'):
-        line += f"\n    {video['note']}"
+        line = f"录屏: {video.get('method')}: {video.get('note', '')}"
+    else:
+        line = (f"录屏: {os.path.basename(video['path'])}  ·  录屏秒 = 记录秒 {video['offset']:+.3f}"
+                f"({video.get('method')})")
+        if video.get('note'):
+            line += f"\n    {video['note']}"
+    if video.get('flow'):
+        line += f"\n    {video['flow']}"
     return line
 
 

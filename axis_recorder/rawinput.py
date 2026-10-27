@@ -128,6 +128,15 @@ WHEEL_DELTA = 120
 LAG_REPORT_MS = 32
 # 开局前这几秒的按键也算进这一局: 自动认开局要等锁定框/血条出来, 人往往先出了手
 PREROLL_SECONDS = 3.0
+# 这些键按了不算出招(走路、跳、冲刺、系统键; F1~F12 另算, 是插件和录屏的热键), 其余键和鼠标键都算
+NOT_ACTION_KEYS = frozenset({'w', 'a', 's', 'd', 'space', 'lshift', 'rshift', 'ctrl', 'rctrl', 'alt', 'ralt',
+                             'lwin', 'rwin', 'apps', 'tab', 'esc', 'capslock', 'printscreen'})
+
+
+def is_action(device, key):
+    if device != 'key':
+        return True
+    return key not in NOT_ACTION_KEYS and not (key[:1] == 'f' and key[1:].isdigit())
 
 
 def key_name(vk, make_code, flags):
@@ -215,6 +224,8 @@ class InputLog:
         self.paused_since = None
         # 插件自己替人按录屏快捷键时, 这段时间里软件模拟的按键不记
         self.mute_until = 0.0
+        # 最后一次出招(is_action 的键按下)的时刻, 不管有没有在记; 手打收局拿它判人还在不在打
+        self.last_action = 0.0
 
     def mute_injected(self, seconds):
         with self.lock:
@@ -261,6 +272,8 @@ class InputLog:
                 if injected and t < self.mute_until:
                     return  # 录屏快捷键, 松开那下也因为没记按下被丢掉
                 self.held[held_key] = t
+                if not injected and is_action(device, key):
+                    self.last_action = t
             elif self.held.pop(held_key, None) is None:
                 return  # 开始采集前、切出游戏前就按着的键
             if device == 'key':
