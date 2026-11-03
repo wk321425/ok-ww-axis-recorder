@@ -32,7 +32,12 @@ except Exception:
     FluentIcon = SegmentedWidget = MessageBox = MessageBoxBase = InfoBar = InfoBarPosition = SubtitleLabel = None
 
     def isDarkTheme():
-        return False
+        # ok-script 2.1 起宿主用自己的控件库, 深浅色从它的主题读
+        try:
+            from ok.ui.qt.kit.theme import theme
+            return theme.is_dark()
+        except Exception:
+            return False
 
 LABEL_W = 210
 RULER_H = 24
@@ -872,6 +877,8 @@ class AxisRecorderTab(QWidget):
         self.name = '跑轴复盘'
         if FluentIcon is not None:
             self.icon = getattr(FluentIcon, 'HISTORY', FluentIcon.APPLICATION)
+        else:
+            self.icon = 'history'
         self._out_dir = out_dir
         self.run = None
         self.media = None

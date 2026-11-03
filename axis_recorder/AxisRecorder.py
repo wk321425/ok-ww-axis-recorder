@@ -7,7 +7,33 @@ from .screenrec import MODE_REPLAY, MODE_TOGGLE, REC_OFF, TOOLS
 
 logger = Logger.get_logger(__name__)
 
-PLUGIN_VERSION = '0.4.7'
+PLUGIN_VERSION = '0.4.8'
+
+
+def _fix_imported_task_tab():
+    """ok-script 2.1 起插件任务页继承 TasksPage, 名字写死成 "TasksPage", 和主任务页撞导航 key, 主窗口起不来。
+
+    插件任务模块在建主窗口之前导入, 这里给它补个按插件区分的名字。两个插件都带这段, 只包一层。
+    """
+    try:
+        from ok.ui.qt.plugins import imported_tabs
+    except Exception:
+        return  # 旧版没有这个模块
+    cls = getattr(imported_tabs, 'ImportedTaskTab', None)
+    if cls is None or getattr(cls.__init__, '_okww_unique_name', False):
+        return
+    original = cls.__init__
+
+    def __init__(self, namespace, *args, **kwargs):
+        original(self, namespace, *args, **kwargs)
+        if self.objectName() == 'TasksPage':
+            self.setObjectName(f'TasksPage_{namespace}')
+
+    __init__._okww_unique_name = True
+    cls.__init__ = __init__
+
+
+_fix_imported_task_tab()
 
 MODE_CODE = '测试代码'
 MODE_MANUAL = '人为操作'
@@ -137,7 +163,8 @@ class AxisRecorderTask(TriggerTask):
             from qfluentwidgets import FluentIcon
             self.group_icon = FluentIcon.SAVE
         except Exception:
-            pass
+            # ok-script 2.1 起没有 qfluentwidgets, 图标用宿主自带的名字
+            self.group_icon = 'camera'
         self.trigger_interval = 1
         self.recorder = None
         self._failed_reason = None
